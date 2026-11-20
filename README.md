@@ -99,3 +99,26 @@ Put Caddy or nginx in front of it for HTTPS. In this mode no SSH is needed.
 ```sh
 npm ci && npm run build && npm test   # tests run against a fake Asterisk, both locally and over a real SSH connection
 ```
+
+
+## App tools: voice agents on the same server (v1.1)
+
+The installer also sets up access to the voice-agent apps (e.g. `/opt/bcu-livekit`, the LiveKit / Sweet Spot agent) so Claude can check what is really running and fix it:
+
+| Tool | What it does |
+|---|---|
+| `server_services` | State, start time, command and folder of each allowed service |
+| `service_logs` | Recent journal lines for a service, optionally filtered (secrets masked) |
+| `restart_service` | Restart an allowed service and report its state + latest logs (drops live calls on it) |
+| `list_app_files` / `read_app_file` | Browse and read code/config in the allowed folders (secret values shown as «hidden») |
+| `edit_app_file` / `write_app_file` | Exact-text edits or new files; backed up first; Python must compile or nothing is saved |
+| `list_app_backups` / `restore_app_file` | Undo any change |
+
+All of it goes through one root-owned script, `/usr/local/sbin/claude-app-helper`, which enforces the rules itself:
+
+* Only the folders and services listed in `/etc/claude-app-helper.conf` (root-owned; the installer fills it in from the services it finds; edit it to add or remove).
+* Never readable: `.env` files, keys and certificates, databases, call recordings, `.git`, virtualenvs.
+* Secret values in readable files and logs are masked; Claude can't add secrets to files, and a file that contains secrets can only be edited (secrets kept), never replaced.
+* The connector user's sudo rule allows only `asterisk -rx …` and this helper.
+
+If Asterisk isn't on the machine, the installer sets up the app tools only.

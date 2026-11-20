@@ -1,5 +1,6 @@
 #!/bin/sh
-# One-command install of the Asterisk connector ON the Asterisk server itself (no SSH, no Docker, no Lovable).
+# One-command install of the connector ON the server itself (no SSH, no Docker, no Lovable):
+# Asterisk configs/CLI, plus the voice-agent app folders (e.g. /opt/bcu-livekit) and their services.
 #   sudo sh setup/install-on-asterisk-server.sh [your-domain]
 # Without a domain it uses <server-ip>.sslip.io, which points at this server, for a free HTTPS certificate.
 # Safe to run again: it updates the code and keeps the existing token.
@@ -11,25 +12,59 @@ ENVF=/etc/asterisk-connector.env
 SVC_USER=claude-mcp
 PORT=8787
 AST_BIN="$(command -v asterisk || echo /usr/sbin/asterisk)"
-[ -x "$AST_BIN" ] || { echo "Asterisk not found."; exit 1; }
-AST_GROUP="$(stat -c %G /etc/asterisk)"
+if [ -x "$AST_BIN" ] && [ -d /etc/asterisk ]; then HAS_AST=1; AST_GROUP="$(stat -c %G /etc/asterisk)"
+else HAS_AST=0; AST_GROUP=nogroup; getent group nogroup >/dev/null || AST_GROUP=nobody; echo "Asterisk not found on this machine: installing the app tools only."; fi
 ARCH="$(uname -m)"; case "$ARCH" in x86_64) NA=x64; CA=amd64;; aarch64|arm64) NA=arm64; CA=arm64;; *) echo "Unsupported CPU $ARCH"; exit 1;; esac
 say() { printf '\n== %s\n' "$*"; }
 
 say "Service user"
 id "$SVC_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$SVC_USER"
-usermod -aG "$AST_GROUP" "$SVC_USER"
+[ "$HAS_AST" = 1 ] && usermod -aG "$AST_GROUP" "$SVC_USER"
 
+if [ "$HAS_AST" = 1 ]; then
 say "Permissions (config read/write via the $AST_GROUP group, logs readable)"
 chgrp -R "$AST_GROUP" /etc/asterisk
 chmod -R g+rwX /etc/asterisk
 find /etc/asterisk -type d -exec chmod g+s {} +
 mkdir -p /etc/asterisk/.claude-backups; chgrp "$AST_GROUP" /etc/asterisk/.claude-backups; chmod 2770 /etc/asterisk/.claude-backups
 [ -d /var/log/asterisk ] && { chgrp -R "$AST_GROUP" /var/log/asterisk; chmod -R g+rX /var/log/asterisk; } || true
+fi
 
-say "sudo rule: $SVC_USER may run ONLY '$AST_BIN -rx ...'"
-printf 'Defaults:%s !requiretty\n%s ALL=(root) NOPASSWD: %s -rx *\n' "$SVC_USER" "$SVC_USER" "$AST_BIN" > /etc/sudoers.d/claude-mcp
+say "sudo rule: $SVC_USER may run ONLY '$AST_BIN -rx ...' and the claude-app-helper"
+if [ "$HAS_AST" = 1 ]; then ALLOWED="$AST_BIN -rx *, /usr/local/sbin/claude-app-helper *"; else ALLOWED="/usr/local/sbin/claude-app-helper *"; fi
+printf 'Defaults:%s !requiretty\n%s ALL=(root) NOPASSWD: %s\n' "$SVC_USER" "$SVC_USER" "$ALLOWED" > /etc/sudoers.d/claude-mcp
 chmod 440 /etc/sudoers.d/claude-mcp; visudo -cf /etc/sudoers.d/claude-mcp >/dev/null
+
+say "App access (voice-agent folders and services) through claude-app-helper"
+install -o root -g root -m 755 "$SRC/setup/claude-app-helper.py" /usr/local/sbin/claude-app-helper
+HCONF=/etc/claude-app-helper.conf
+if [ -f "$HCONF" ]; then
+  echo "Keeping existing $HCONF (edit it to change which folders/services Claude may use)."
+else
+  PAT='livekit|sweetspot|taxi|bcu|phone-server|aggs|kks|ada|voice|agent'
+  UNITS="$( { systemctl list-unit-files --type=service --no-legend 2>/dev/null; systemctl list-units --all --type=service --no-legend 2>/dev/null; } \
+    | awk '{for(i=1;i<=NF;i++) if ($i ~ /\.service$/) {print $i; break}}' | grep -Ei "$PAT" | grep -v -e asterisk-connector -e caddy-connector | sort -u | paste -sd, -)"
+  DIRS="/opt/bcu-livekit"
+  PY=""
+  for u in $(echo "$UNITS" | tr , ' '); do
+    wd="$(systemctl show "$u" -p WorkingDirectory --value 2>/dev/null)"
+    case "$wd" in /opt/*|/srv/*) DIRS="$DIRS,$wd";; esac
+    ex="$(systemctl show "$u" -p ExecStart --value 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
+    case "$ex" in *python*) [ -z "$PY" ] && [ -x "$ex" ] && PY="$ex";; esac
+  done
+  DIRS="$(echo "$DIRS" | tr , '\n' | awk 'NF && !seen[$0]++' | while read -r d; do [ -d "$d" ] && echo "$d"; done | paste -sd, -)"
+  cat > "$HCONF" <<EOF
+# Which folders and services Claude may use through the connector. Root-owned: only an admin can change this.
+# Keys, .env files, certificates and call recordings inside these folders are never readable.
+dirs = ${DIRS}
+units = ${UNITS}
+backup_dir = /var/backups/claude-app
+python = ${PY:-$(command -v python3)}
+EOF
+  chown root:root "$HCONF"; chmod 644 "$HCONF"
+fi
+echo "Folders:  $(sed -n 's/^dirs = //p' "$HCONF")"
+echo "Services: $(sed -n 's/^units = //p' "$HCONF")"
 
 say "Node.js"
 NODE=""
@@ -49,7 +84,7 @@ echo "Using $NODE ($("$NODE" -v))"
 
 say "Install app to $APP"
 mkdir -p "$APP"
-cp -r "$SRC/package.json" "$SRC/package-lock.json" "$SRC/tsconfig.json" "$SRC/src" "$APP/"
+rm -rf "$APP/src"; cp -r "$SRC/package.json" "$SRC/package-lock.json" "$SRC/tsconfig.json" "$SRC/src" "$APP/"
 cd "$APP"
 PATH="$(dirname "$NODE"):$PATH" "$NPM" ci --no-audit --no-fund --loglevel=error
 PATH="$(dirname "$NODE"):$PATH" "$NODE" node_modules/typescript/bin/tsc
@@ -70,15 +105,18 @@ ASTERISK_CMD=sudo -n $AST_BIN
 ASTERISK_CONF_DIR=/etc/asterisk
 ASTERISK_LOG_DIR=/var/log/asterisk
 ALLOW_WRITE=true
+APP_HELPER_CMD=sudo -n /usr/local/sbin/claude-app-helper
+ASTERISK_TOOLS=$([ "$HAS_AST" = 1 ] && echo true || echo false)
 EOF
 fi
+grep -q '^APP_HELPER_CMD=' "$ENVF" || echo 'APP_HELPER_CMD=sudo -n /usr/local/sbin/claude-app-helper' >> "$ENVF"
 chown root:"$SVC_USER" "$ENVF"; chmod 640 "$ENVF"
 
 say "Service asterisk-connector"
 cat > /etc/systemd/system/asterisk-connector.service <<EOF
 [Unit]
 Description=Asterisk connector for Claude (MCP)
-After=network-online.target asterisk.service
+After=network-online.target
 
 [Service]
 User=$SVC_USER
@@ -156,12 +194,13 @@ cat <<EOF
 
 =====================================================================
  Done. In Claude: Settings -> Connectors -> Add custom connector
-   Name: Asterisk
+   Name: BCU Server
    URL:  https://$HOST/mcp/$TOKEN  ${HTTPS_NOTE:-}
 
  Keep this URL private: the long code in it is the password.
  Logs:      journalctl -u asterisk-connector -f
  Read-only: set ALLOW_WRITE=false in $ENVF, then: systemctl restart asterisk-connector
+ App folders/services Claude may use: /etc/claude-app-helper.conf
  Remove:    systemctl disable --now asterisk-connector caddy-connector
 =====================================================================
 EOF

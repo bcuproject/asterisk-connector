@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { Asterisk, RELOADS, UserError, applyEdit, configFromEnv, reloadFor } from "./asterisk.js";
 import { LocalRunner, type Runner, SshRunner } from "./runner.js";
+import { AppServer } from "./app.js";
 
 const TOKEN = process.env.CONNECTOR_TOKEN || "";
 if (TOKEN.length < 32) { console.error("CONNECTOR_TOKEN must be at least 32 characters (try: openssl rand -hex 32)."); process.exit(1); }
@@ -12,13 +13,15 @@ const runner: Runner = process.env.RUN_MODE === "local" ? new LocalRunner() : Ss
 const cfg = configFromEnv();
 const ast = new Asterisk(runner, cfg);
 const PORT = Number(process.env.PORT || 8787);
+// App side (voice agents in /opt/...): on when APP_HELPER_CMD is set (the installer sets it).
+const appSrv = process.env.APP_HELPER_CMD ? new AppServer(runner, process.env.APP_HELPER_CMD, cfg.allowWrite) : null;
 
 const audit = (tool: string, args: unknown, ok: boolean, note = "") =>
   console.log(JSON.stringify({ t: new Date().toISOString(), tool, args, ok, note }));
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 const fail = (s: string) => ({ content: [{ type: "text" as const, text: s }], isError: true });
 
-const SECRET_KEYS = new Set(["content", "old_text", "new_text"]);
+const SECRET_KEYS = new Set(["content", "old_text", "new_text"]); // file contents never go in the audit log
 /** Wraps a tool handler: audit log + friendly errors. Config file contents are never logged. */
 function wrap<A extends Record<string, unknown>>(name: string, fn: (a: A) => Promise<ReturnType<typeof text>>) {
   return async (a: A) => {
@@ -47,12 +50,19 @@ async function afterWrite(file: string, reload: boolean, rollbackOnError: boolea
 }
 
 function buildServer() {
-  const s = new McpServer({ name: "asterisk-connector", version: "1.0.0" }, {
-    instructions: "Manages an Asterisk PBX. Always read a config file before editing it and prefer edit_config over write_config. " +
-      "Explain the change to the user before saving. Changes are backed up automatically and the matching module is reloaded; " +
-      "check the reported warnings. Use restore_backup to undo. CLI access is read-only.",
+  const s = new McpServer({ name: "asterisk-connector", version: "1.1.0" }, {
+    instructions: "Manages an Asterisk PBX" + (appSrv ? " and the voice-agent apps on the same server (files in the allowed /opt folders, their systemd services and logs)" : "") + ". " +
+      "Always read a file before editing it and prefer edit tools over whole-file writes. Explain the change to the user before saving. " +
+      "Changes are backed up automatically. Asterisk configs reload their module and roll back on ERROR; app files need restart_service to take effect, " +
+      "which drops live calls on that service, so confirm with the user first. Use the restore tools to undo. CLI access is read-only. Secrets are masked and can't be read.",
   });
 
+  if (process.env.ASTERISK_TOOLS !== "false") registerAsteriskTools(s);
+  if (appSrv) registerAppTools(s, appSrv);
+  return s;
+}
+
+function registerAsteriskTools(s: McpServer) {
   s.registerTool("server_status", { title: "Asterisk status", description: "Asterisk version, uptime and active call count.", inputSchema: {}, annotations: { readOnlyHint: true } },
     wrap("server_status", async () => text(await ast.status())));
 
@@ -126,7 +136,61 @@ function buildServer() {
     inputSchema: { lines: z.number().int().min(1).max(1000).default(100), filter: z.string().optional(), log: z.string().default("messages") },
   }, wrap("tail_log", async (a: { lines: number; filter?: string; log: string }) => text(await ast.tailLog(a.lines, a.filter, a.log))));
 
-  return s;
+}
+
+/** App side: the voice agents' files in /opt/... and their systemd services (via claude-app-helper). */
+function registerAppTools(s: McpServer, a: AppServer) {
+  const saved = (r: { backup: string | null; diff: string }, restartHint = true) =>
+    `Saved.${r.backup ? ` Backup: ${r.backup}` : ""}\n\n${r.diff || "(no changes)"}${restartHint ? "\n\nThe running service still uses the old code until it is restarted (restart_service)." : ""}`;
+
+  s.registerTool("server_services", { title: "App services", annotations: { readOnlyHint: true },
+    description: "State, start time, command and folder of each allowed app service on the server (e.g. the LiveKit/Sweet Spot voice agent).", inputSchema: {} },
+  wrap("server_services", async () => text(await a.services())));
+
+  s.registerTool("service_logs", { title: "App service logs", annotations: { readOnlyHint: true },
+    description: "Recent journal lines for an allowed app service, optionally filtered by text (e.g. a call id, 'error', 'fish'). Secrets are masked.",
+    inputSchema: { service: z.string(), lines: z.number().int().min(1).max(2000).default(150), filter: z.string().optional() } },
+  wrap("service_logs", async (x: { service: string; lines: number; filter?: string }) => text(await a.logs(x.service, x.lines, x.filter))));
+
+  s.registerTool("restart_service", { title: "Restart an app service", annotations: { destructiveHint: true },
+    description: "Restart an allowed app service so saved code changes take effect; reports its state and latest logs. Live calls on that service drop, so confirm with the user first and avoid busy times.",
+    inputSchema: { service: z.string() } },
+  wrap("restart_service", async ({ service }: { service: string }) => text(await a.restart(service))));
+
+  s.registerTool("list_app_files", { title: "List app files", annotations: { readOnlyHint: true },
+    description: "List files in the allowed app folders (e.g. /opt/bcu-livekit). Keys, .env files and call recordings are never shown.",
+    inputSchema: { folder: z.string().optional() } },
+  wrap("list_app_files", async ({ folder }: { folder?: string }) => text(await a.list(folder))));
+
+  s.registerTool("read_app_file", { title: "Read an app file", annotations: { readOnlyHint: true },
+    description: "Read a text/code file from an allowed app folder, with line numbers and a sha256 for edits. Secret values are masked as «hidden».",
+    inputSchema: { path: z.string(), from_line: z.number().int().min(1).optional(), to_line: z.number().int().min(1).optional() } },
+  wrap("read_app_file", async (x: { path: string; from_line?: number; to_line?: number }) => {
+    const f = await a.read(x.path);
+    const lines = f.content.split("\n"); const s0 = (x.from_line ?? 1) - 1, e = Math.min(lines.length, x.to_line ?? lines.length);
+    return text(`# ${f.path} (${lines.length} lines, sha256 ${f.sha256}${f.secrets_masked ? ", secrets masked" : ""})\n` +
+      lines.slice(s0, e).map((l, i) => `${String(s0 + i + 1).padStart(5)}  ${l}`).join("\n"));
+  }));
+
+  s.registerTool("edit_app_file", { title: "Edit an app file", annotations: { destructiveHint: false },
+    description: "Replace an exact piece of text in an app file (copy old_text from read_app_file without line numbers). Backs up first; Python files must compile or nothing is saved. Does NOT restart the service.",
+    inputSchema: { path: z.string(), old_text: z.string(), new_text: z.string(), replace_all: z.boolean().default(false), expected_sha256: z.string().optional() } },
+  wrap("edit_app_file", async (x: { path: string; old_text: string; new_text: string; replace_all: boolean; expected_sha256?: string }) =>
+    text(saved(await a.edit(x.path, x)))));
+
+  s.registerTool("write_app_file", { title: "Write a whole app file", annotations: { destructiveHint: true },
+    description: "Create a new text/code file in an allowed app folder, or replace a whole one (pass expected_sha256 from read_app_file). Files containing secrets can only be edited, not replaced. Prefer edit_app_file.",
+    inputSchema: { path: z.string(), content: z.string(), expected_sha256: z.string().optional() } },
+  wrap("write_app_file", async (x: { path: string; content: string; expected_sha256?: string }) => text(saved(await a.write(x.path, x.content, x.expected_sha256)))));
+
+  s.registerTool("list_app_backups", { title: "List app file backups", annotations: { readOnlyHint: true },
+    description: "Automatic backups of app files (newest first), optionally for one file.", inputSchema: { path: z.string().optional() } },
+  wrap("list_app_backups", async ({ path }: { path?: string }) => text(await a.backups(path))));
+
+  s.registerTool("restore_app_file", { title: "Restore an app file backup", annotations: { destructiveHint: true },
+    description: "Put a backed-up version of an app file back (the current version is backed up first). Restart the service afterwards to apply.",
+    inputSchema: { path: z.string(), backup: z.string() } },
+  wrap("restore_app_file", async (x: { path: string; backup: string }) => text(saved(await a.restore(x.path, x.backup)))));
 }
 
 const tokenOk = (t: string | undefined) => {
