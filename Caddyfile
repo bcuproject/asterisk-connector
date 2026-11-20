@@ -1,0 +1,15 @@
+{$DOMAIN} {
+	encode gzip
+	# Only the MCP endpoint and health check are exposed
+	@allowed path /mcp /mcp/* /health
+	handle @allowed {
+		reverse_proxy connector:8787
+	}
+	handle {
+		respond 404
+	}
+	log {
+		output stdout
+		format json
+	}
+}

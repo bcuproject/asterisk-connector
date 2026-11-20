@@ -1,0 +1,21 @@
+# docker compose up -d   — runs the connector behind Caddy (automatic HTTPS for $DOMAIN)
+services:
+  connector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./keys:/keys:ro          # put the private key at ./keys/id_ed25519 and set ASTERISK_SSH_KEY=/keys/id_ed25519
+    expose: ["8787"]
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [connector]
+volumes:
+  caddy_data:
