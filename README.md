@@ -32,7 +32,21 @@ A custom connector (remote MCP server) that lets Claude look after your Asterisk
 
 ---
 
-## Setup (about 15 minutes)
+## Quickest setup: install on the Asterisk server itself (one command)
+Log in to the server (PuTTY or a terminal) and paste:
+```sh
+cd /tmp && curl -fsSL https://github.com/bcuproject/asterisk-connector/archive/refs/heads/main.tar.gz | tar xz && sudo sh asterisk-connector-main/setup/install-on-asterisk-server.sh
+```
+The script:
+- creates the locked-down `claude-mcp` user
+- installs Node.js if it isn't there
+- starts the connector as a service on `127.0.0.1` only
+- puts HTTPS in front of it with Caddy, using `<server-ip>.sslip.io` (free, no domain needed)
+- prints the URL to add in Claude
+
+If ports 80/443 are already used by another web server, it prints a proxy snippet to add to that server instead. Run it again any time to update the connector; your token is kept.
+
+## Setup on a separate machine (Docker + SSH)
 
 You need:
 - A machine with Docker that is reachable from the internet. A small VPS is fine, and so is the PBX itself.
