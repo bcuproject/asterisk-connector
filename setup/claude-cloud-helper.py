@@ -239,7 +239,7 @@ def cmd_create(_):
         raise Refused("Not created: confirm must be true (each shop server costs about $12 a month).")
     e = env()
     host = e.get("PUBLIC_HOST", "")
-    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}(:[0-9]{2,5})?", host):  # the connector may run on its own port, e.g. :8788
         raise Refused("PUBLIC_HOST is missing in /etc/claude-cloud.env; rerun the connector installer.")
     name = re.sub(r"\s+", " ", str(b.get("shop_name") or "").strip())
     if not re.fullmatch(NAME_RE, name):

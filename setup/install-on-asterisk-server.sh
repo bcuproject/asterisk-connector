@@ -150,7 +150,8 @@ curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null && echo "Connector is runni
 
 say "HTTPS"
 IP="$(curl -fsS -4 --max-time 5 https://ifconfig.me || hostname -I | awk '{print $1}')"
-OLDHOST="$(sed -n '1s/ *{.*//p' /etc/caddy-connector/Caddyfile 2>/dev/null)"
+# The site line in the existing Caddyfile (may carry its own port, e.g. host:8788, and follow a global { } block).
+OLDHOST="$(grep -m1 -oE '^[a-z0-9.-]+\.[a-z]{2,}(:[0-9]{2,5})?' /etc/caddy-connector/Caddyfile 2>/dev/null || true)"
 HOST="${1:-${OLDHOST:-$(echo "$IP" | tr . -).sslip.io}}"
 if [ "$CLOUD" = 1 ]; then
   CE=/etc/claude-cloud.env
