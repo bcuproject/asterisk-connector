@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Asterisk, RELOADS, UserError, applyEdit, configFromEnv, reloadFor } from "./asterisk.js";
 import { LocalRunner, type Runner, SshRunner } from "./runner.js";
 import { AppServer } from "./app.js";
+import { CloudServer } from "./cloud.js";
 
 const TOKEN = process.env.CONNECTOR_TOKEN || "";
 if (TOKEN.length < 32) { console.error("CONNECTOR_TOKEN must be at least 32 characters (try: openssl rand -hex 32)."); process.exit(1); }
@@ -15,6 +16,8 @@ const ast = new Asterisk(runner, cfg);
 const PORT = Number(process.env.PORT || 8787);
 // App side (voice agents in /opt/...): on when APP_HELPER_CMD is set (the installer sets it).
 const appSrv = process.env.APP_HELPER_CMD ? new AppServer(runner, process.env.APP_HELPER_CMD, cfg.allowWrite) : null;
+// Creating the Sweet Spot server on DigitalOcean: on when CLOUD_HELPER_CMD is set (the installer sets it on the BCU server).
+const cloud = process.env.CLOUD_HELPER_CMD ? new CloudServer(runner, process.env.CLOUD_HELPER_CMD, cfg.allowWrite) : null;
 
 const audit = (tool: string, args: unknown, ok: boolean, note = "") =>
   console.log(JSON.stringify({ t: new Date().toISOString(), tool, args, ok, note }));
@@ -59,6 +62,7 @@ function buildServer() {
 
   if (process.env.ASTERISK_TOOLS !== "false") registerAsteriskTools(s);
   if (appSrv) registerAppTools(s, appSrv);
+  if (cloud) registerCloudTools(s, cloud);
   return s;
 }
 
@@ -136,6 +140,25 @@ function registerAsteriskTools(s: McpServer) {
     inputSchema: { lines: z.number().int().min(1).max(1000).default(100), filter: z.string().optional(), log: z.string().default("messages") },
   }, wrap("tail_log", async (a: { lines: number; filter?: string; log: string }) => text(await ast.tailLog(a.lines, a.filter, a.log))));
 
+}
+
+/** Cloud side: create the one Sweet Spot server on DigitalOcean (via claude-cloud-helper, which holds the token). */
+function registerCloudTools(s: McpServer, c: CloudServer) {
+  s.registerTool("cloud_status", { title: "Sweet Spot server status", annotations: { readOnlyHint: true },
+    description: "Whether the DigitalOcean token and the Sweet Spot kit are in place, the Sweet Spot server (if any), and its install progress: " +
+      "status, address, the one-time setup link once ready, or the install log if it failed.", inputSchema: {} },
+  wrap("cloud_status", async () => text(await c.status())));
+
+  s.registerTool("cloud_ssh_keys", { title: "DigitalOcean SSH keys", annotations: { readOnlyHint: true },
+    description: "Names of the SSH keys on the DigitalOcean account; all of them are put on the new server.", inputSchema: {} },
+  wrap("cloud_ssh_keys", async () => text(await c.sshKeys())));
+
+  s.registerTool("create_sweetspot_server", { title: "Create the Sweet Spot server", annotations: { destructiveHint: false, openWorldHint: true },
+    description: "Creates THE Sweet Spot server on DigitalOcean (London, 2 GB, Ubuntu 24.04, about $12/month) which installs the Sweet Spot " +
+      "ordering system and its own connector by itself, then reports back (about 8-10 minutes; check cloud_status). Refuses if one already " +
+      "exists. Costs money: only call when the user has explicitly asked to create it, with confirm: true.",
+    inputSchema: { confirm: z.literal(true), custom_domain: z.string().max(120).optional() } },
+  wrap("create_sweetspot_server", async ({ custom_domain }: { confirm: true; custom_domain?: string }) => text(await c.create(custom_domain))));
 }
 
 /** App side: the voice agents' files in /opt/... and their systemd services (via claude-app-helper). */
@@ -225,6 +248,8 @@ async function handle(req: express.Request, res: express.Response) {
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 }
+// The new Sweet Spot server downloads its kit and reports back here, each with its own one-time code.
+if (cloud) cloud.routes(app);
 app.all("/mcp/:token", handle);
 app.all("/mcp", handle);
 

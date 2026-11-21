@@ -31,9 +31,17 @@ mkdir -p /etc/asterisk/.claude-backups; chgrp "$AST_GROUP" /etc/asterisk/.claude
 fi
 
 say "sudo rule: $SVC_USER may run ONLY '$AST_BIN -rx ...' and the claude-app-helper"
+CLOUD="${CLOUD:-$HAS_AST}"   # creating the Sweet Spot server on DigitalOcean: on the phone server only (CLOUD=0 to skip)
 if [ "$HAS_AST" = 1 ]; then ALLOWED="$AST_BIN -rx *, /usr/local/sbin/claude-app-helper *"; else ALLOWED="/usr/local/sbin/claude-app-helper *"; fi
+[ "$CLOUD" = 1 ] && ALLOWED="$ALLOWED, /usr/local/sbin/claude-cloud-helper *"
 printf 'Defaults:%s !requiretty\n%s ALL=(root) NOPASSWD: %s\n' "$SVC_USER" "$SVC_USER" "$ALLOWED" > /etc/sudoers.d/claude-mcp
 chmod 440 /etc/sudoers.d/claude-mcp; visudo -cf /etc/sudoers.d/claude-mcp >/dev/null
+
+if [ "$CLOUD" = 1 ]; then
+  say "Sweet Spot server creation through claude-cloud-helper (it alone holds the DigitalOcean token)"
+  install -o root -g root -m 755 "$SRC/setup/claude-cloud-helper.py" /usr/local/sbin/claude-cloud-helper
+  install -d -o root -g root -m 700 /var/lib/claude-cloud
+fi
 
 say "App access (voice-agent folders and services) through claude-app-helper"
 install -o root -g root -m 755 "$SRC/setup/claude-app-helper.py" /usr/local/sbin/claude-app-helper
@@ -110,6 +118,8 @@ ASTERISK_TOOLS=$([ "$HAS_AST" = 1 ] && echo true || echo false)
 EOF
 fi
 grep -q '^APP_HELPER_CMD=' "$ENVF" || echo 'APP_HELPER_CMD=sudo -n /usr/local/sbin/claude-app-helper' >> "$ENVF"
+if [ "$CLOUD" = 1 ]; then grep -q '^CLOUD_HELPER_CMD=' "$ENVF" || echo 'CLOUD_HELPER_CMD=sudo -n /usr/local/sbin/claude-cloud-helper' >> "$ENVF"
+else sed -i '/^CLOUD_HELPER_CMD=/d' "$ENVF"; fi
 chown root:"$SVC_USER" "$ENVF"; chmod 640 "$ENVF"
 
 say "Service asterisk-connector"
@@ -140,9 +150,19 @@ curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null && echo "Connector is runni
 
 say "HTTPS"
 IP="$(curl -fsS -4 --max-time 5 https://ifconfig.me || hostname -I | awk '{print $1}')"
-HOST="${1:-$(echo "$IP" | tr . -).sslip.io}"
+OLDHOST="$(sed -n '1s/ *{.*//p' /etc/caddy-connector/Caddyfile 2>/dev/null)"
+HOST="${1:-${OLDHOST:-$(echo "$IP" | tr . -).sslip.io}}"
+if [ "$CLOUD" = 1 ]; then
+  CE=/etc/claude-cloud.env
+  [ -f "$CE" ] || ( umask 077; printf '# DigitalOcean access for claude-cloud-helper. Root-only. Never paste the token into chat.\nDO_TOKEN=\n' > "$CE" )
+  sed -i '/^PUBLIC_HOST=/d' "$CE"; echo "PUBLIC_HOST=$HOST" >> "$CE"; chown root:root "$CE"; chmod 600 "$CE"
+fi
 busy() { (ss -ltnH "sport = :$1" 2>/dev/null || netstat -ltn 2>/dev/null | grep ":$1 ") | grep -q .; }
 if systemctl is-active --quiet caddy-connector; then
+  if ! grep -q '/cloud/\*' /etc/caddy-connector/Caddyfile; then
+    sed -i 's#@mcp path /mcp /mcp/\* /health#@mcp path /mcp /mcp/* /health /cloud/*#' /etc/caddy-connector/Caddyfile
+    systemctl restart caddy-connector
+  fi
   echo "Caddy (connector) already set up."
 elif busy 443 || busy 80; then
   echo "Ports 80/443 are already used by another web server on this machine:"
@@ -159,7 +179,7 @@ else
   mkdir -p /etc/caddy-connector
   cat > /etc/caddy-connector/Caddyfile <<EOF
 $HOST {
-	@mcp path /mcp /mcp/* /health
+	@mcp path /mcp /mcp/* /health /cloud/*
 	handle @mcp {
 		reverse_proxy 127.0.0.1:$PORT
 	}
@@ -201,6 +221,7 @@ cat <<EOF
  Logs:      journalctl -u asterisk-connector -f
  Read-only: set ALLOW_WRITE=false in $ENVF, then: systemctl restart asterisk-connector
  App folders/services Claude may use: /etc/claude-app-helper.conf
+ Sweet Spot server (phone server only): store the DigitalOcean token with  sudo claude-cloud-helper set-token
  Remove:    systemctl disable --now asterisk-connector caddy-connector
 =====================================================================
 EOF

@@ -122,3 +122,49 @@ All of it goes through one root-owned script, `/usr/local/sbin/claude-app-helper
 * The connector user's sudo rule allows only `asterisk -rx …` and this helper.
 
 If Asterisk isn't on the machine, the installer sets up the app tools only.
+
+## Creating the Sweet Spot server (phone server only)
+
+The connector on the phone server can create **one** Sweet Spot server on DigitalOcean (London, 2 GB, Ubuntu 24.04).
+
+### How it works
+
+1. The new server installs the Sweet Spot ordering system and its own connector by itself.
+2. It then reports back, and `cloud_status` shows the one-time setup link.
+
+### Tools
+
+- `cloud_status`
+- `cloud_ssh_keys`
+- `create_sweetspot_server`, which needs `confirm: true` and refuses if the server already exists
+
+There is no tool or code path to delete, resize, power off or rebuild a server.
+
+### The DigitalOcean token
+
+The token is held by the root-only `claude-cloud-helper` in `/etc/claude-cloud.env`. The connector process never sees it. To store it, run this on the server and paste the token when asked (the input is hidden):
+
+    sudo claude-cloud-helper set-token
+
+### The kit
+
+Upload the kit once, from your computer:
+
+    scp sweetspot-system.zip root@<phone server>:/var/lib/claude-cloud/
+
+### What the new server uses while it installs
+
+The new server downloads the kit from `/cloud/kit/<code>` and reports back to `/cloud/callback`. Each step has its own one-time code: the kit code expires after 3 hours or 5 downloads, and the report code works once.
+
+### Adding the new server's connector in Claude
+
+Its address stays on the phone server. Read it with:
+
+    sudo claude-cloud-helper connector-url
+
+Then add it in Claude settings.
+
+### Tests
+
+    python3 test/cloud-test.py
+    node test/cloud-e2e.mjs
