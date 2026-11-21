@@ -132,6 +132,20 @@ The connector on the phone server can create **one** Sweet Spot server on Digita
 1. The new server installs the Sweet Spot ordering system and its own connector by itself.
 2. It then reports back, and `cloud_status` shows the one-time setup link.
 
+### The private page
+
+There's also a private page with the same steps, at `https://<phone server>/cloud/ui#k=<key>`:
+- save the DigitalOcean token
+- upload the kit
+- the **Create Sweet Spot server** button
+- live progress, then the setup link
+
+The installer prints the page's link. To print it again, run:
+
+    sudo claude-cloud-helper ui-link
+
+The page's key is checked by the root helper on every action, and 10 wrong keys lock the page for 15 minutes.
+
 ### Tools
 
 - `cloud_status`

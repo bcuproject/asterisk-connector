@@ -11,12 +11,16 @@ Root-owned. The connector's service user may run it through sudo; the DigitalOce
   callback    (stdin JSON)   the new server's report when installing finishes (one-time code)
   set-token                  (admin, interactive) store the DigitalOcean token with a hidden prompt
   connector-url              (admin) print the new server's connector address, to add in Claude settings
+  ui <status|token|create>   (stdin JSON with "key") the private web page's actions; the key is UI_KEY in /etc/claude-cloud.env
+  ui-kit                     (stdin: one JSON line with "key", then the zip bytes) the page's kit upload
+  ui-link                    (admin) print the private page's address
 
 Deliberately missing: delete, resize, power off, rebuild, or any DigitalOcean call other than
 GET /v2/account/keys, GET /v2/droplets, GET /v2/droplets/<id> and POST /v2/droplets."""
 import base64
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
@@ -297,8 +301,94 @@ def cmd_connector_url(_):
     return None
 
 
+# ------------------------------------------------------------------ private web page (/cloud/ui)
+UI_LOCK_FAILS, UI_LOCK_SECONDS = 10, 900
+
+
+def _ui_auth(key: str) -> None:
+    """The page's key must match UI_KEY; 10 wrong keys in 15 minutes locks the page for everyone."""
+    s = load_state()
+    now = time.time()
+    fails = [t for t in s.get("ui_fails", []) if now - t < UI_LOCK_SECONDS]
+    if len(fails) >= UI_LOCK_FAILS:
+        raise Refused("locked: too many wrong keys, try again in 15 minutes")
+    expected = env().get("UI_KEY", "")
+    if len(expected) >= 32 and isinstance(key, str) and secrets.compare_digest(sha(key), sha(expected)):
+        return
+    s["ui_fails"] = fails + [now]
+    save_state(s)
+    raise Refused("wrong key")
+
+
+def cmd_ui(args):
+    b = json.loads(sys.stdin.read() or "{}")
+    _ui_auth(b.get("key", ""))
+    what = args[0] if args else ""
+    if what == "status":
+        out = cmd_status(None)
+        try:
+            out["new_server_connector_url"] = open(CONNECTOR_URL).read().strip()  # the page owner may see it; Claude never calls this
+        except OSError:
+            out["new_server_connector_url"] = None
+        out["install"].pop("new_server_connector", None)
+        return out
+    if what == "token":
+        t = str(b.get("token", "")).strip()
+        if not re.fullmatch(r"dop_v1_[0-9A-Za-z]{40,128}", t):
+            raise Refused("That doesn't look like a DigitalOcean token (it starts with dop_v1_).")
+        e = env()
+        e["DO_TOKEN"] = t
+        write_env(e)
+        try:
+            n = len(cmd_ssh_keys(None))
+        except Refused as ex:
+            return {"saved": True, "works": False, "message": str(ex)}
+        return {"saved": True, "works": True, "message": f"Token works. {n} SSH key(s) on the account will go on the new server."}
+    if what == "create":
+        sys.stdin = io.StringIO(json.dumps({"confirm": b.get("confirm") is True, "custom_domain": b.get("custom_domain") or ""}))
+        return cmd_create(None)
+    raise Refused("unknown page action")
+
+
+def cmd_ui_kit(_):
+    first = sys.stdin.buffer.readline(4096)
+    try:
+        key = json.loads(first or b"{}").get("key", "")
+    except ValueError:
+        key = ""
+    _ui_auth(key)
+    data = sys.stdin.buffer.read(25 * 1024 * 1024 + 1)
+    if len(data) > 25 * 1024 * 1024 or not data.startswith(b"PK\x03\x04"):
+        raise Refused("That isn't a zip file (or it's over 25 MB).")
+    import zipfile  # noqa: PLC0415
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+    except zipfile.BadZipFile:
+        raise Refused("That zip file is damaged.")
+    if "sweetspot-project/install.sh" not in names or any(n.startswith("/") or ".." in n.split("/") for n in names):
+        raise Refused("That isn't the Sweet Spot kit (sweetspot-project/install.sh is missing).")
+    tmp = KIT + ".upload"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, KIT)
+    return {"saved": True, **kit_info()}
+
+
+def cmd_ui_link(_):
+    if os.environ.get("SUDO_USER") == "claude-mcp":
+        raise Refused("Only you can read this, on the server: sudo claude-cloud-helper ui-link")
+    e = env()
+    if not e.get("UI_KEY") or not e.get("PUBLIC_HOST"):
+        raise Refused("No page key yet: rerun the connector installer.")
+    print(f"https://{e['PUBLIC_HOST']}/cloud/ui#k={e['UI_KEY']}")
+    return None
+
+
 COMMANDS = {"status": cmd_status, "ssh-keys": cmd_ssh_keys, "create": cmd_create, "kit": cmd_kit, "callback": cmd_callback,
-            "set-token": cmd_set_token, "connector-url": cmd_connector_url}
+            "set-token": cmd_set_token, "connector-url": cmd_connector_url,
+            "ui": cmd_ui, "ui-kit": cmd_ui_kit, "ui-link": cmd_ui_link}
 
 
 def main(argv):

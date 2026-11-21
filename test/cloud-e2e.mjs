@@ -2,13 +2,18 @@
 // The helper runs with test folders and a canned DigitalOcean (test/cloud-helper-stub.py).
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const D = "/tmp/fakecloud"; rmSync(D, { recursive: true, force: true }); mkdirSync(`${D}/state`, { recursive: true });
-writeFileSync(`${D}/cloud.env`, "DO_TOKEN=dop_v1_secret\nPUBLIC_HOST=bcu.example.com\n");
+const UIK = "u".repeat(48);
+writeFileSync(`${D}/cloud.env`, `DO_TOKEN=dop_v1_secret\nPUBLIC_HOST=bcu.example.com\nUI_KEY=${UIK}\n`);
+// A real (small) Sweet Spot-shaped kit for the page's upload check.
+mkdirSync(`${D}/k/sweetspot-project`, { recursive: true }); writeFileSync(`${D}/k/sweetspot-project/install.sh`, "echo hi\n");
+execSync(`cd ${D}/k && zip -qr ${D}/real-kit.zip sweetspot-project`);
 const kit = randomBytes(2_500_000);  // bigger than the normal 2 MB command output limit
 writeFileSync(`${D}/state/sweetspot-system.zip`, kit);
 const TOKEN = "k".repeat(40), PORT = 18789;
@@ -54,6 +59,53 @@ try {
       body: JSON.stringify({ token: cb, ok: true, ip: "9.9.9.9", domain: dom, setup_url: `https://${dom}/setup#t=${"e".repeat(48)}` }) });
     assert.equal(r.status, 200);
     const s = await call(c, "cloud_status"); assert.match(s.t, /"status": "ready"/); assert.match(s.t, /setup#t=e{48}/);
+  });
+  // ------------------------------------------------------------- the private page
+  const page = (what, body) => fetch(`${base}/cloud/api/${what}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  await t("page loads with strict security headers", async () => {
+    const r = await fetch(`${base}/cloud/ui`); assert.equal(r.status, 200);
+    assert.match(r.headers.get("content-security-policy"), /default-src 'none'/); assert.match(await r.text(), /Create Sweet Spot server/);
+  });
+  await t("page actions refuse a wrong key", async () => { const r = await page("status", { key: "x".repeat(48) }); assert.equal(r.status, 403); });
+  await t("page shows status with the right key (never the DigitalOcean token)", async () => {
+    const r = await page("status", { key: UIK }); assert.equal(r.status, 200); const s = await r.text();
+    assert.match(s, /"status": "ready"/); assert.doesNotMatch(s, /dop_v1_secret/);
+  });
+  await t("page saves a new token and checks it works", async () => {
+    const r = await page("token", { key: UIK, token: "dop_v1_" + "f".repeat(64) }); const d = await r.json();
+    assert.equal(r.status, 200); assert.equal(d.works, true); assert.match(readFileSync(`${D}/cloud.env`, "utf8"), /DO_TOKEN=dop_v1_f{64}/);
+  });
+  await t("page refuses something that isn't a token", async () => { const r = await page("token", { key: UIK, token: "hello" }); assert.equal(r.status, 400); });
+  await t("page uploads the Sweet Spot kit", async () => {
+    const r = await fetch(`${base}/cloud/api/kit`, { method: "POST", headers: { "Content-Type": "application/zip", "x-ui-key": UIK }, body: readFileSync(`${D}/real-kit.zip`) });
+    const d = await r.json(); assert.equal(r.status, 200, JSON.stringify(d)); assert.equal(d.bytes, readFileSync(`${D}/real-kit.zip`).length);
+  });
+  await t("page refuses a zip that isn't the kit, and non-zips", async () => {
+    execSync(`cd ${D} && echo x > other.txt && zip -q other.zip other.txt`);
+    const a = await fetch(`${base}/cloud/api/kit`, { method: "POST", headers: { "x-ui-key": UIK }, body: readFileSync(`${D}/other.zip`) });
+    const b = await fetch(`${base}/cloud/api/kit`, { method: "POST", headers: { "x-ui-key": UIK }, body: "not a zip" });
+    assert.equal(a.status, 400); assert.equal(b.status, 400);
+  });
+  await t("page upload refuses a wrong key", async () => {
+    const r = await fetch(`${base}/cloud/api/kit`, { method: "POST", headers: { "x-ui-key": "z".repeat(48) }, body: readFileSync(`${D}/real-kit.zip`) });
+    assert.equal(r.status, 403);
+  });
+  await t("page create refuses while the server exists", async () => {
+    const r = await page("create", { key: UIK, confirm: true }); assert.equal(r.status, 400); assert.match((await r.json()).error, /already exists/);
+  });
+  await t("the new server's connector address shows on the page only", async () => {
+    const st = JSON.parse(readFileSync(`${D}/state/state.json`, "utf8")); st.status = "installing";
+    st.callback_code_hash = createHash("sha256").update("a".repeat(48)).digest("hex"); st.codes_expire = Date.now() / 1000 + 3600;
+    writeFileSync(`${D}/state/state.json`, JSON.stringify(st));
+    const dom = "9-9-9-9.sslip.io", cu = `https://${dom}/mcp/${"9".repeat(64)}`;
+    const cb = await fetch(`${base}/cloud/callback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: "a".repeat(48), ok: true, domain: dom, connector_url: cu }) });
+    assert.equal(cb.status, 200);
+    const p2 = await (await page("status", { key: UIK })).text(); assert.ok(p2.includes(cu));
+    const mcp = await call(c, "cloud_status"); assert.ok(!mcp.t.includes("9".repeat(64)), "Claude's tool must not see it");
+  });
+  await t("10 wrong keys lock the page", async () => {
+    for (let i = 0; i < 10; i++) await page("status", { key: "w".repeat(48) });
+    const r = await page("status", { key: UIK }); assert.equal(r.status, 403); assert.match((await r.json()).error, /Too many/);
   });
   await t("MCP needs the connector code", async () => { const r = await fetch(`${base}/mcp/wrong`, { method: "POST" }); assert.equal(r.status, 404); });
   await t("audit log never holds the token or codes", async () => { const l = logs.join(""); assert.doesNotMatch(l, /dop_v1_secret/); assert.ok(!l.includes(kitCode) && !l.includes(cb)); });

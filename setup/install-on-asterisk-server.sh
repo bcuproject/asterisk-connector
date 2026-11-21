@@ -155,7 +155,9 @@ HOST="${1:-${OLDHOST:-$(echo "$IP" | tr . -).sslip.io}}"
 if [ "$CLOUD" = 1 ]; then
   CE=/etc/claude-cloud.env
   [ -f "$CE" ] || ( umask 077; printf '# DigitalOcean access for claude-cloud-helper. Root-only. Never paste the token into chat.\nDO_TOKEN=\n' > "$CE" )
-  sed -i '/^PUBLIC_HOST=/d' "$CE"; echo "PUBLIC_HOST=$HOST" >> "$CE"; chown root:root "$CE"; chmod 600 "$CE"
+  sed -i '/^PUBLIC_HOST=/d' "$CE"; echo "PUBLIC_HOST=$HOST" >> "$CE"
+  grep -q '^UI_KEY=.\{32,\}' "$CE" || echo "UI_KEY=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$CE"
+  chown root:root "$CE"; chmod 600 "$CE"
 fi
 busy() { (ss -ltnH "sport = :$1" 2>/dev/null || netstat -ltn 2>/dev/null | grep ":$1 ") | grep -q .; }
 if systemctl is-active --quiet caddy-connector; then
@@ -210,6 +212,12 @@ EOF
 fi
 
 TOKEN="$(sed -n 's/^CONNECTOR_TOKEN=//p' "$ENVF")"
+UI_LINE=""
+if [ "$CLOUD" = 1 ]; then
+  UI_LINE="
+ Create the Sweet Spot server (private page; keep this link to yourself):
+   https://$HOST/cloud/ui#k=$(sed -n 's/^UI_KEY=//p' /etc/claude-cloud.env)"
+fi
 cat <<EOF
 
 =====================================================================
@@ -221,7 +229,7 @@ cat <<EOF
  Logs:      journalctl -u asterisk-connector -f
  Read-only: set ALLOW_WRITE=false in $ENVF, then: systemctl restart asterisk-connector
  App folders/services Claude may use: /etc/claude-app-helper.conf
- Sweet Spot server (phone server only): store the DigitalOcean token with  sudo claude-cloud-helper set-token
+${UI_LINE:-}
  Remove:    systemctl disable --now asterisk-connector caddy-connector
 =====================================================================
 EOF
