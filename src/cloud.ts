@@ -64,7 +64,7 @@ export class CloudServer {
     });
     app.post("/cloud/api/:what", async (req, res) => {
       const what = String(req.params.what);
-      if (!["status", "token", "create", "menu"].includes(what)) { res.status(404).end(); return; }
+      if (!["status", "token", "create", "menu", "update"].includes(what)) { res.status(404).end(); return; }
       if (what !== "status" && !this.allowWrite) { res.status(400).json({ error: "This connector is read-only." }); return; }
       const out = await this.r.run(`${this.helper} ui ${what}`, JSON.stringify(req.body ?? {}), 90_000);
       if (out.code === 0) res.type("json").send(out.stdout); else await refused(res, out.stderr.trim() || "failed");

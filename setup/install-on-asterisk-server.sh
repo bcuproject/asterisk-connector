@@ -158,6 +158,8 @@ if [ "$CLOUD" = 1 ]; then
   [ -f "$CE" ] || ( umask 077; printf '# DigitalOcean access for claude-cloud-helper. Root-only. Never paste the token into chat.\nDO_TOKEN=\n' > "$CE" )
   sed -i '/^PUBLIC_HOST=/d' "$CE"; echo "PUBLIC_HOST=$HOST" >> "$CE"
   grep -q '^UI_KEY=.\{32,\}' "$CE" || echo "UI_KEY=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$CE"
+  # Which GitHub branch the page's Update button installs (the one with the shop-server features).
+  grep -q '^UPDATE_BRANCH=' "$CE" || echo "UPDATE_BRANCH=${UPDATE_BRANCH:-sweetspot-server}" >> "$CE"
   chown root:root "$CE"; chmod 600 "$CE"
 fi
 busy() { (ss -ltnH "sport = :$1" 2>/dev/null || netstat -ltn 2>/dev/null | grep ":$1 ") | grep -q .; }

@@ -18,6 +18,7 @@ then reports back. At most one server per shop, and at most MAX_SHOPS (default 1
   ui <status|token|create|menu>   (stdin JSON with "key") the private web page's actions; key = UI_KEY in /etc/claude-cloud.env
   ui-kit                     (stdin: one JSON line with "key", then the zip bytes) the page's kit upload
   ui-link                    (admin) print the private page's address
+  ui update                  the page's Update button: reinstall the connector from GitHub (UPDATE_BRANCH), in the background
 
 Deliberately missing: delete, resize, power off, rebuild, or any DigitalOcean call other than
 GET /v2/account/keys, GET /v2/droplets, GET /v2/droplets/<id> and POST /v2/droplets."""
@@ -29,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -387,6 +389,55 @@ def cmd_ui_link(_):
     return None
 
 
+# ------------------------------------------------------------------ Update button (connector + this page)
+UPDATE_LOG = "/var/log/claude-connector-update.log"
+UPDATE_REPO = "https://github.com/bcuproject/asterisk-connector/archive/refs/heads"
+SECRET_LINE = re.compile(r"/mcp/|#k=|token|key|secret|password", re.I)
+
+
+def update_status() -> dict:
+    u = load_state().get("update") or {}
+    if not u:
+        return {"running": False, "last": None}
+    running = subprocess.run(["systemctl", "is-active", "--quiet", u["unit"]]).returncode == 0
+    result, lines = None, []
+    try:
+        with open(UPDATE_LOG, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        pass
+    exits = [ln for ln in lines if ln.startswith("EXIT=")]
+    if exits:
+        result = "ok" if exits[-1] == "EXIT=0" else "failed"
+    # Never show lines that could hold a password (the installer prints the connector address and page link).
+    safe = [ln for ln in lines if ln.strip() and not ln.startswith("EXIT=") and not SECRET_LINE.search(ln)][-8:]
+    return {"running": running and result is None, "started_at": u.get("started_at"), "branch": u.get("branch"),
+            "result": result, "detail": safe if result == "failed" else safe[-2:]}
+
+
+def start_update() -> dict:
+    st = update_status()
+    if st["running"]:
+        raise Refused("An update is already running.")
+    branch = env().get("UPDATE_BRANCH") or "sweetspot-server"
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", branch):
+        raise Refused("UPDATE_BRANCH in /etc/claude-cloud.env isn't a plain branch name.")
+    unit = f"claude-connector-update-{int(time.time())}"
+    fd = os.open(UPDATE_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # root-only: the installer prints passwords
+    os.close(fd)
+    script = (f'set -e; d="$(mktemp -d)"; cd "$d"; curl -fsSL --max-time 300 {UPDATE_REPO}/{branch}.tar.gz | tar xz; '
+              f'sh ./*/setup/install-on-asterisk-server.sh')
+    # Its own systemd unit: the installer restarts the connector (and this helper's parent) without cutting itself off.
+    r = subprocess.run(["systemd-run", f"--unit={unit}", "--collect", "--quiet", "/bin/sh", "-c",
+                        f"( {script} ) >> {UPDATE_LOG} 2>&1; echo EXIT=$? >> {UPDATE_LOG}"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refused("Couldn't start the update.")
+    s = load_state()
+    s["update"] = {"unit": unit, "started_at": now_utc(), "branch": branch}
+    save_state(s)
+    return {"started": True, "branch": branch, "message": "Updating — about 2 minutes. The page reconnects by itself."}
+
+
 # ------------------------------------------------------------------ private web page (/cloud/ui)
 UI_LOCK_FAILS, UI_LOCK_SECONDS = 10, 900
 
@@ -412,6 +463,7 @@ def cmd_ui(args):
     what = args[0] if args else ""
     if what == "status":
         out = cmd_status(None)
+        out["update"] = update_status()
         for slug, sh in out["shops"].items():  # the page owner may see these addresses; Claude's tools never do
             try:
                 sh["connector_url"] = open(connector_path(slug)).read().strip()
@@ -443,6 +495,8 @@ def cmd_ui(args):
             raise Refused("That menu has no items.")
         _write_private(menu_path(slug), json.dumps(menu).encode())
         return {"saved": True, "slug": slug, "sections": len(menu["categories"]), "items": items}
+    if what == "update":
+        return start_update()
     if what == "create":
         sys.stdin = io.StringIO(json.dumps({"confirm": b.get("confirm") is True, "shop_name": b.get("shop_name"), "slug": b.get("slug"),
                                             "custom_domain": b.get("custom_domain") or "", "phone_ordering": b.get("phone_ordering") is True}))

@@ -70,6 +70,12 @@ export const CLOUD_UI = `<!doctype html>
     <div class="msg" id="createMsg"></div>
     <p>Each server is about <b>$12 a month</b> on your DigitalOcean bill. This page can create servers but can't delete or change them.</p>
   </section>
+
+  <section id="upd"><h2>Update this page</h2>
+    <p>Installs the latest version of this page and Claude's connector from your GitHub repo (bcuproject/asterisk-connector). Calls aren't affected.</p>
+    <div id="updState"></div>
+    <button id="updBtn">Update now</button><div class="msg" id="updMsg"></div>
+  </section>
   </div>
 </main>
 <script>
@@ -118,11 +124,17 @@ function shopCard(slug, sh, server) {
 
 async function refresh() {
   let s;
-  try { s = await call("status"); } catch (e) { if (e.message !== "locked") $("createMsg").textContent = e.message; return; }
+  try { s = await call("status"); } catch (e) { if (e.message !== "locked" && !timer) $("createMsg").textContent = e.message; return; }  // quiet while the connector restarts
   $("s1").classList.toggle("done", s.token_set);
   $("tokState").innerHTML = s.token_set ? '<span class="ok">✔ saved</span>' : "";
   $("s2").classList.toggle("done", !!s.kit);
   $("kitState").innerHTML = s.kit ? '<span class="ok">✔ ' + Math.round(s.kit.bytes / 1024) + " KB, " + esc(s.kit.uploaded) + " UTC</span>" : "";
+  const u = s.update || {};
+  $("updBtn").disabled = !!u.running;
+  $("updState").innerHTML = u.running ? '<p class="wait">Updating (started ' + esc(u.started_at) + ")…</p>" :
+    u.result === "ok" ? '<p class="ok">✔ Last update: ' + esc(u.started_at) + " (" + esc(u.branch) + ")</p>" :
+    u.result === "failed" ? '<p class="bad">Last update failed (' + esc(u.started_at) + ")</p><pre>" + esc((u.detail || []).join("\n")) + "</pre><p>Send this to Claude.</p>" : "";
+  if (u.running && !timer) timer = setInterval(refresh, 10000);
   ready = s.token_set && !!s.kit;
   $("create").disabled = !ready || !$("name").value.trim();
   const servers = {}; (s.servers || []).forEach((x) => { if (x.shop) servers[x.shop] = x; });
@@ -130,7 +142,7 @@ async function refresh() {
   $("shops").innerHTML = slugs.map((k) => shopCard(k, (s.shops || {})[k] || { shop_name: k }, servers[k])).join("");
   const busy = slugs.some((k) => ["installing", "creating"].includes(((s.shops || {})[k] || {}).status));
   if (busy && !timer) timer = setInterval(refresh, 15000);
-  if (!busy && timer) { clearInterval(timer); timer = null; }
+  if (!busy && !u.running && timer) { clearInterval(timer); timer = null; }
 }
 $("tokSave").onclick = async () => {
   const t = $("tok").value.trim(); if (!t) return;
@@ -162,6 +174,13 @@ $("create").onclick = async () => {
     ["name", "slug", "dom"].forEach((i) => { $(i).value = ""; }); $("menu").value = ""; $("voice").checked = false; slugEdited = false;
   } catch (e) { $("createMsg").innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
   refresh();
+};
+$("updBtn").onclick = async () => {
+  if (!confirm("Update this page and Claude's connector from GitHub now? It takes about 2 minutes.")) return;
+  $("updBtn").disabled = true;
+  try { const r = await call("update"); $("updMsg").textContent = r.message; }
+  catch (e) { $("updMsg").innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
+  setTimeout(refresh, 3000); if (!timer) timer = setInterval(refresh, 10000);
 };
 if (!key) lock(); else refresh();
 </script>

@@ -173,6 +173,41 @@ cloud.write_env({"DO_TOKEN": TOKEN, "PUBLIC_HOST": "206-189-123-28.sslip.io", "U
 code, _, err = run(["create"], json.dumps({"confirm": True, "shop_name": "Third Shop"}))
 check(code == 1 and "limit" in err, "no more servers than MAX_SHOPS")
 
+print("Update button")
+runs = []
+class Done:  # stand-in for subprocess results
+    def __init__(self, rc): self.returncode, self.stdout, self.stderr = rc, "", ""
+def fake_run(cmd, **kw):
+    runs.append(cmd)
+    if cmd[0] == "systemctl":
+        return Done(0 if fake_run.active else 3)
+    return Done(0)
+fake_run.active = False
+cloud.subprocess.run = fake_run
+cloud.UPDATE_LOG = os.path.join(tmp, "update.log")
+code, out, err = run(["ui", "update"], json.dumps({"key": "x" * 48}))
+check(code == 1, "the Update button needs the page key")
+code, out, err = run(["ui", "update"], json.dumps({"key": "u" * 48}))
+cmd = runs[-1]
+check(code == 0 and cmd[0] == "systemd-run" and "github.com/bcuproject/asterisk-connector/archive/refs/heads/sweetspot-server.tar.gz" in cmd[-1],
+      "update runs in its own background unit, from your GitHub repo only")
+check(oct(os.stat(cloud.UPDATE_LOG).st_mode & 0o777) == "0o600", "the update log is root-only (the installer prints passwords)")
+fake_run.active = True
+code, _, err = run(["ui", "update"], json.dumps({"key": "u" * 48}))
+check(code == 1 and "already running" in err, "only one update at a time")
+open(cloud.UPDATE_LOG, "w").write("== Install app\n URL:  https://h/mcp/" + "9" * 64 + "\n https://h/cloud/ui#k=" + "u" * 48 + "\nConnector is running on 127.0.0.1:8787\nEXIT=0\n")
+fake_run.active = False
+code, out, _ = run(["ui", "status"], json.dumps({"key": "u" * 48}))
+u = json.loads(out)["update"]
+check(u["result"] == "ok" and not u["running"] and "9" * 64 not in out and "#k=" not in out, "page shows the update worked, never the passwords it printed")
+open(cloud.UPDATE_LOG, "w").write("npm ERR! something broke\nCONNECTOR_TOKEN=" + "e" * 64 + "\nEXIT=1\n")
+code, out, _ = run(["ui", "status"], json.dumps({"key": "u" * 48}))
+u = json.loads(out)["update"]
+check(u["result"] == "failed" and "npm ERR! something broke" in u["detail"] and "e" * 64 not in out, "a failed update shows its error lines, minus anything secret")
+cloud.write_env({"DO_TOKEN": TOKEN, "PUBLIC_HOST": "206-189-123-28.sslip.io", "UI_KEY": "u" * 48, "UPDATE_BRANCH": "main; rm -rf /"})
+code, _, err = run(["ui", "update"], json.dumps({"key": "u" * 48}))
+check(code == 1 and "branch" in err, "a strange branch name is refused")
+
 print("Admin-only commands")
 os.environ["SUDO_USER"] = "claude-mcp"
 for c in (["connector-url", "sweetspot"], ["set-token"], ["ui-link"]):
