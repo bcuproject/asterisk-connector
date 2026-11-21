@@ -62,6 +62,10 @@ try {
   });
   // ------------------------------------------------------------- the private page
   const page = (what, body) => fetch(`${base}/cloud/api/${what}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  await t("page script has no syntax errors", async () => {
+    const html = await (await fetch(`${base}/cloud/ui`)).text();
+    new Function(html.split("<script>")[1].split("</script>")[0]);  // throws on a syntax error
+  });
   await t("page loads with strict security headers", async () => {
     const r = await fetch(`${base}/cloud/ui`); assert.equal(r.status, 200);
     assert.match(r.headers.get("content-security-policy"), /default-src 'none'/); assert.match(await r.text(), /Add a shop/);

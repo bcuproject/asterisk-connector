@@ -133,7 +133,7 @@ async function refresh() {
   $("updBtn").disabled = !!u.running;
   $("updState").innerHTML = u.running ? '<p class="wait">Updating (started ' + esc(u.started_at) + ")…</p>" :
     u.result === "ok" ? '<p class="ok">✔ Last update: ' + esc(u.started_at) + " (" + esc(u.branch) + ")</p>" :
-    u.result === "failed" ? '<p class="bad">Last update failed (' + esc(u.started_at) + ")</p><pre>" + esc((u.detail || []).join("\n")) + "</pre><p>Send this to Claude.</p>" : "";
+    u.result === "failed" ? '<p class="bad">Last update failed (' + esc(u.started_at) + ")</p><pre>" + esc((u.detail || []).join(String.fromCharCode(10))) + "</pre><p>Send this to Claude.</p>" : "";
   if (u.running && !timer) timer = setInterval(refresh, 10000);
   ready = s.token_set && !!s.kit;
   $("create").disabled = !ready || !$("name").value.trim();
