@@ -123,60 +123,59 @@ All of it goes through one root-owned script, `/usr/local/sbin/claude-app-helper
 
 If Asterisk isn't on the machine, the installer sets up the app tools only.
 
-## Creating the Sweet Spot server (phone server only)
+## Creating shop servers (phone server only)
 
-The connector on the phone server can create **one** Sweet Spot server on DigitalOcean (London, 2 GB, Ubuntu 24.04).
+The connector on the phone server can create one DigitalOcean server **per shop**: Sweet Spot, or any other shop.
 
-### How it works
+### What each server gets
 
-1. The new server installs the Sweet Spot ordering system and its own connector by itself.
-2. It then reports back, and `cloud_status` shows the one-time setup link.
+- London, 2 GB, Ubuntu 24.04, named `shop-<short name>` and tagged `bcu-shop` + `shop-<short name>`.
+- It installs the shop ordering system and its own connector by itself, then reports back.
+- WhatsApp ordering, the back panel and tablet printing.
+- Phone ordering, if ticked; it's tuned to Sweet Spot's menu.
+
+### Limits
+
+- One server per shop.
+- At most `MAX_SHOPS` servers in total (default 10, set in `/etc/claude-cloud.env`).
+- No tool or code path can delete, resize, power off or rebuild a server.
 
 ### The private page
 
-There's also a private page with the same steps, at `https://<phone server>/cloud/ui#k=<key>`:
-- save the DigitalOcean token
-- upload the kit
-- the **Create Sweet Spot server** button
-- live progress, then the setup link
-
-The installer prints the page's link. To print it again, run:
+The page lives at `https://<phone server>/cloud/ui#k=<key>`. The installer prints its link, and you can print it again with:
 
     sudo claude-cloud-helper ui-link
 
+On the page you can:
+- save the DigitalOcean token
+- upload the kit (`sweetspot-system.zip`)
+- add a shop: its name, an optional menu file (`shop-menu/1` JSON, see the kit's `shop-menu-template.json`) and phone ordering on or off
+- create the shop's server with one button
+
+Each shop then gets its own card showing:
+- install progress
+- the one-time setup link
+- the server's connector address
+
 The page's key is checked by the root helper on every action, and 10 wrong keys lock the page for 15 minutes.
 
-### Tools
+### Claude's tools
 
 - `cloud_status`
 - `cloud_ssh_keys`
-- `create_sweetspot_server`, which needs `confirm: true` and refuses if the server already exists
-
-There is no tool or code path to delete, resize, power off or rebuild a server.
+- `create_shop_server`, which needs `confirm: true`
 
 ### The DigitalOcean token
 
-The token is held by the root-only `claude-cloud-helper` in `/etc/claude-cloud.env`. The connector process never sees it. To store it, run this on the server and paste the token when asked (the input is hidden):
+The token is held by the root-only `claude-cloud-helper` in `/etc/claude-cloud.env`. The connector process never sees it. You can also store it from the command line, with hidden input:
 
     sudo claude-cloud-helper set-token
 
-### The kit
+### What each new server uses while it installs
 
-Upload the kit once, from your computer:
+Each server downloads the kit (and its menu) from `/cloud/kit/<code>` and reports back to `/cloud/callback`. Each step has its own one-time code. A shop server's connector address stays on the phone server; read it with:
 
-    scp sweetspot-system.zip root@<phone server>:/var/lib/claude-cloud/
-
-### What the new server uses while it installs
-
-The new server downloads the kit from `/cloud/kit/<code>` and reports back to `/cloud/callback`. Each step has its own one-time code: the kit code expires after 3 hours or 5 downloads, and the report code works once.
-
-### Adding the new server's connector in Claude
-
-Its address stays on the phone server. Read it with:
-
-    sudo claude-cloud-helper connector-url
-
-Then add it in Claude settings.
+    sudo claude-cloud-helper connector-url <short name>
 
 ### Tests
 

@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""claude-cloud-helper: lets the connector create ONE Sweet Spot server on DigitalOcean, and nothing else.
+"""claude-cloud-helper: lets the connector create shop servers on DigitalOcean (one per shop), and nothing else.
 
 Root-owned. The connector's service user may run it through sudo; the DigitalOcean token lives in
 /etc/claude-cloud.env (root-only), so the connector itself never sees it.
 
-  status                     what exists: token set?, kit uploaded?, Sweet Spot droplets, install progress
-  ssh-keys                   the account's SSH key names (which go on the new server)
-  create      (stdin JSON)   {"confirm": true, "custom_domain": ""}  creates the droplet (refuses if one exists)
-  kit <token>                base64 of the kit, for the new server only (one-time code, 3 hours, 5 downloads)
-  callback    (stdin JSON)   the new server's report when installing finishes (one-time code)
+Each shop (Sweet Spot, or any other) gets its own server: London, 2 GB, Ubuntu 24.04, named shop-<slug>,
+tagged bcu-shop + shop-<slug>. It installs the shop ordering system (and its own connector) by itself,
+then reports back. At most one server per shop, and at most MAX_SHOPS (default 10) in total.
+
+  status                     token set?, kit uploaded?, every shop's server and install progress
+  ssh-keys                   the account's SSH key names (they all go on new servers)
+  create      (stdin JSON)   {"confirm": true, "shop_name": "Burger Barn", "slug": "burgerbarn", "custom_domain": "", "phone_ordering": false}
+  kit <code> [menu]          base64 of the kit (or the shop's menu), for the new server only (one-time code, 3 hours)
+  callback    (stdin JSON)   a new server's report when installing finishes (one-time code)
   set-token                  (admin, interactive) store the DigitalOcean token with a hidden prompt
-  connector-url              (admin) print the new server's connector address, to add in Claude settings
-  ui <status|token|create>   (stdin JSON with "key") the private web page's actions; the key is UI_KEY in /etc/claude-cloud.env
+  connector-url <slug>       (admin) print a shop server's connector address, to add in Claude settings
+  ui <status|token|create|menu>   (stdin JSON with "key") the private web page's actions; key = UI_KEY in /etc/claude-cloud.env
   ui-kit                     (stdin: one JSON line with "key", then the zip bytes) the page's kit upload
   ui-link                    (admin) print the private page's address
 
@@ -34,19 +38,23 @@ ENV = "/etc/claude-cloud.env"
 STATE_DIR = "/var/lib/claude-cloud"
 KIT = os.path.join(STATE_DIR, "sweetspot-system.zip")
 STATE = os.path.join(STATE_DIR, "state.json")
-CONNECTOR_URL = os.path.join(STATE_DIR, "new-server-connector.txt")
-TAG = "sweetspot-orders"
-DROPLET = {"name": "sweetspot-orders", "region": "lon1", "size": "s-1vcpu-2gb", "image": "ubuntu-24-04-x64",
-           "tags": [TAG], "monitoring": True, "ipv6": False}
+MENUS = os.path.join(STATE_DIR, "menus")
+CONNECTORS = os.path.join(STATE_DIR, "connectors")
+ALL_TAG = "bcu-shop"
+SIZE = {"region": "lon1", "size": "s-1vcpu-2gb", "image": "ubuntu-24-04-x64", "monitoring": True, "ipv6": False}
 CODE_HOURS = 3
-KIT_DOWNLOADS = 5
+KIT_DOWNLOADS = 10   # kit + menu, with a few retries
 API = "https://api.digitalocean.com/v2"
+SLUG_RE = r"[a-z0-9][a-z0-9-]{1,22}[a-z0-9]"
+NAME_RE = r"[A-Za-z0-9][A-Za-z0-9 &.-]{0,38}[A-Za-z0-9.]"
+DOMAIN_RE = r"[a-z0-9-]+(\.[a-z0-9-]+)+"
 
 
 class Refused(Exception):
     pass
 
 
+# ------------------------------------------------------------------ files
 def env() -> dict:
     out = {}
     try:
@@ -60,44 +68,52 @@ def env() -> dict:
     return out
 
 
-def write_env(values: dict) -> None:
-    lines = [f"{k}={v}" for k, v in values.items()]
-    tmp = ENV + ".tmp"
+def _write_private(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write("# DigitalOcean access for claude-cloud-helper. Root-only. Never paste this token into chat.\n" + "\n".join(lines) + "\n")
-    os.replace(tmp, ENV)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def write_env(values: dict) -> None:
+    head = "# DigitalOcean access for claude-cloud-helper. Root-only. Never paste this token into chat.\n"
+    _write_private(ENV, (head + "\n".join(f"{k}={v}" for k, v in values.items()) + "\n").encode())
 
 
 def load_state() -> dict:
     try:
         with open(STATE) as f:
-            return json.load(f)
+            s = json.load(f)
     except (OSError, ValueError):
-        return {}
+        s = {}
+    s.setdefault("shops", {})
+    return s
 
 
 def save_state(s: dict) -> None:
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-    tmp = STATE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(s, f)
-    os.replace(tmp, STATE)
+    _write_private(STATE, json.dumps(s).encode())
 
 
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
+def now_utc() -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+
+# ------------------------------------------------------------------ DigitalOcean (allow-list)
 def do(method: str, path: str, body: dict | None = None) -> dict:
     base = path.split("?", 1)[0]
-    allowed = (method == "GET" and (base == "/account/keys" or re.fullmatch(r"/droplets(/\d+)?", base) is not None)) or (method == "POST" and base == "/droplets")
+    allowed = (method == "GET" and (base == "/account/keys" or re.fullmatch(r"/droplets(/\d+)?", base) is not None)) or \
+              (method == "POST" and base == "/droplets")
     if not allowed:
         raise Refused("That DigitalOcean action isn't allowed.")
     token = env().get("DO_TOKEN", "")
     if not token:
-        raise Refused("No DigitalOcean token yet. On the BCU server run: sudo claude-cloud-helper set-token")
+        raise Refused("No DigitalOcean token yet: save it on the private page (or: sudo claude-cloud-helper set-token).")
     req = urllib.request.Request(API + path, method=method, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     try:
@@ -113,13 +129,14 @@ def do(method: str, path: str, body: dict | None = None) -> dict:
         raise Refused(f"Couldn't reach DigitalOcean: {e.reason}")
 
 
-def droplets() -> list:
-    d = do("GET", f"/droplets?tag_name={TAG}&per_page=20").get("droplets", [])
+def droplets(tag: str = ALL_TAG) -> list:
+    d = do("GET", f"/droplets?tag_name={tag}&per_page=50").get("droplets", [])
     out = []
     for x in d:
         ip = next((n["ip_address"] for n in x.get("networks", {}).get("v4", []) if n.get("type") == "public"), None)
-        out.append({"id": x["id"], "name": x["name"], "status": x["status"], "ip": ip, "region": x.get("region", {}).get("slug"),
-                    "size": x.get("size_slug"), "created_at": x.get("created_at")})
+        slug = next((t[5:] for t in x.get("tags", []) if t.startswith("shop-")), None)
+        out.append({"id": x["id"], "name": x["name"], "shop": slug, "status": x["status"], "ip": ip,
+                    "region": x.get("region", {}).get("slug"), "size": x.get("size_slug"), "created_at": x.get("created_at")})
     return out
 
 
@@ -135,20 +152,35 @@ def kit_info():
     return {"bytes": st.st_size, "sha256": h.hexdigest(), "uploaded": time.strftime("%Y-%m-%d %H:%M", time.gmtime(st.st_mtime))}
 
 
+def menu_path(slug: str) -> str:
+    return os.path.join(MENUS, f"{slug}.json")
+
+
+def connector_path(slug: str) -> str:
+    return os.path.join(CONNECTORS, f"{slug}.txt")
+
+
+# ------------------------------------------------------------------ status
+PUBLIC_SHOP_FIELDS = ("shop_name", "status", "droplet_id", "started_at", "finished_at", "domain", "ip", "setup_url", "error", "log_tail", "phone_ordering")
+
+
 def cmd_status(_):
     e, s = env(), load_state()
-    info = {"token_set": bool(e.get("DO_TOKEN")), "public_host": e.get("PUBLIC_HOST") or None, "kit": kit_info(), "droplets": None,
-            "install": {k: s.get(k) for k in ("status", "droplet_id", "started_at", "finished_at", "domain", "ip", "setup_url", "error", "log_tail") if s.get(k)}}
-    info["install"]["new_server_connector"] = "ready (address: sudo claude-cloud-helper connector-url, on the BCU server)" if os.path.exists(CONNECTOR_URL) else None
+    info = {"token_set": bool(e.get("DO_TOKEN")), "public_host": e.get("PUBLIC_HOST") or None, "kit": kit_info(),
+            "max_shops": int(e.get("MAX_SHOPS") or 10), "servers": None, "shops": {}}
+    for slug, sh in s["shops"].items():
+        info["shops"][slug] = {k: sh.get(k) for k in PUBLIC_SHOP_FIELDS if sh.get(k) is not None}
+        info["shops"][slug]["connector"] = ("ready (address: sudo claude-cloud-helper connector-url " + slug + ")") if os.path.exists(connector_path(slug)) else None
+    info["menus_uploaded"] = sorted(f[:-5] for f in os.listdir(MENUS) if f.endswith(".json")) if os.path.isdir(MENUS) else []
     if info["token_set"]:
         try:
-            info["droplets"] = droplets()
+            info["servers"] = droplets()
         except Refused as ex:
-            info["droplets_error"] = str(ex)
+            info["servers_error"] = str(ex)
     if not info["kit"]:
-        info["next_step"] = f"Upload the kit: scp sweetspot-system.zip root@<BCU server>:{KIT}"
+        info["next_step"] = "Upload the kit (sweetspot-system.zip) on the private page."
     elif not info["token_set"]:
-        info["next_step"] = "Store the DigitalOcean token on the BCU server: sudo claude-cloud-helper set-token"
+        info["next_step"] = "Save the DigitalOcean token on the private page."
     return info
 
 
@@ -156,23 +188,27 @@ def cmd_ssh_keys(_):
     return [{"id": k["id"], "name": k["name"]} for k in do("GET", "/account/keys?per_page=50").get("ssh_keys", [])]
 
 
+# ------------------------------------------------------------------ create
 USER_DATA = r"""#!/bin/bash
-# Sweet Spot server: installs itself once, then reports back. Written by claude-cloud-helper.
+# Shop server: installs itself once, then reports back. Written by claude-cloud-helper.
 set -uo pipefail
-exec > /var/log/sweetspot-provision.log 2>&1
+exec > /var/log/shop-provision.log 2>&1
 KIT_URL='__KIT_URL__'
 KIT_SHA256='__KIT_SHA256__'
+MENU_SHA256='__MENU_SHA256__'
 CALLBACK_URL='__CALLBACK_URL__'
 CALLBACK_TOKEN='__CALLBACK_TOKEN__'
 CUSTOM_DOMAIN='__CUSTOM_DOMAIN__'
+SHOP_NAME='__SHOP_NAME__'
+VOICE='__VOICE__'
 CONNECTOR_TAR='https://github.com/bcuproject/asterisk-connector/archive/refs/heads/main.tar.gz'
 
 report() {  # $1 = true/false
-  local tail curl_body cu=""
-  tail=$(tail -n 30 /var/log/sweetspot-provision.log | tr -d '\000-\010\013-\037"\\' | tail -c 1500)
+  local tail body cu=""
+  tail=$(tail -n 30 /var/log/shop-provision.log | tr -d '\000-\010\013-\037"\\' | tail -c 1500)
   [ -f /etc/asterisk-connector.env ] && cu="https://$DOMAIN/mcp/$(sed -n 's/^CONNECTOR_TOKEN=//p' /etc/asterisk-connector.env)"
-  curl_body="{\"token\":\"$CALLBACK_TOKEN\",\"ok\":$1,\"ip\":\"${IP:-}\",\"domain\":\"${DOMAIN:-}\",\"setup_url\":\"${SETUP_URL:-}\",\"connector_url\":\"$cu\",\"log_tail\":\"$tail\"}"
-  curl -fsS -m 20 -X POST "$CALLBACK_URL" -H "Content-Type: application/json" --data-binary @- <<<"$curl_body" >/dev/null || true
+  body="{\"token\":\"$CALLBACK_TOKEN\",\"ok\":$1,\"ip\":\"${IP:-}\",\"domain\":\"${DOMAIN:-}\",\"setup_url\":\"${SETUP_URL:-}\",\"connector_url\":\"$cu\",\"log_tail\":\"$tail\"}"
+  curl -fsS -m 20 -X POST "$CALLBACK_URL" -H "Content-Type: application/json" --data-binary @- <<<"$body" >/dev/null || true
 }
 fail() { echo "FAILED: $1"; report false; exit 1; }
 
@@ -180,13 +216,19 @@ IP=$(curl -fsS -m 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4
 DOMAIN="${CUSTOM_DOMAIN:-$(echo "$IP" | tr . -).sslip.io}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq unzip curl || fail "apt"
-curl -fsS -m 300 "$KIT_URL" | base64 -d > /root/sweetspot-system.zip || fail "kit download"
-echo "$KIT_SHA256  /root/sweetspot-system.zip" | sha256sum -c - || fail "kit checksum"
-rm -rf /root/sweetspot-project && unzip -q /root/sweetspot-system.zip -d /root || fail "unzip"
-bash /root/sweetspot-project/install.sh "$DOMAIN" || fail "Sweet Spot install"
+curl -fsS -m 300 "$KIT_URL" | base64 -d > /root/shop-kit.zip || fail "kit download"
+echo "$KIT_SHA256  /root/shop-kit.zip" | sha256sum -c - || fail "kit checksum"
+rm -rf /root/sweetspot-project && unzip -q /root/shop-kit.zip -d /root || fail "unzip"
+MENU_FILE=""
+if [ -n "$MENU_SHA256" ]; then
+  curl -fsS -m 120 "$KIT_URL/menu" | base64 -d > /root/menu.json || fail "menu download"
+  echo "$MENU_SHA256  /root/menu.json" | sha256sum -c - || fail "menu checksum"
+  MENU_FILE=/root/menu.json
+fi
+SHOP_NAME="$SHOP_NAME" MENU_FILE="$MENU_FILE" VOICE="$VOICE" bash /root/sweetspot-project/install.sh "$DOMAIN" || fail "shop install"
 SETUP_URL="https://$DOMAIN/setup#t=$(sed -n 's/^SETUP_TOKEN=//p' /etc/sweetspot-bot.env)"
-# The same connector as the BCU server (app tools only), so Claude can manage this server too. Reached at /mcp.
-(cd /root && curl -fsSL "$CONNECTOR_TAR" | tar xz && sh asterisk-connector-main/setup/install-on-asterisk-server.sh "$DOMAIN") || echo "connector install failed (Sweet Spot itself is fine)"
+# The same connector as the phone server (app tools only), so Claude can manage this server too. Reached at /mcp.
+(cd /root && curl -fsSL "$CONNECTOR_TAR" | tar xz && sh asterisk-connector-main/setup/install-on-asterisk-server.sh "$DOMAIN") || echo "connector install failed (the shop itself is fine)"
 report true
 """
 
@@ -194,68 +236,100 @@ report true
 def cmd_create(_):
     b = json.loads(sys.stdin.read() or "{}")
     if b.get("confirm") is not True:
-        raise Refused("Not created: confirm must be true (this creates a paid server, about $12 a month).")
+        raise Refused("Not created: confirm must be true (each shop server costs about $12 a month).")
     e = env()
     host = e.get("PUBLIC_HOST", "")
     if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
         raise Refused("PUBLIC_HOST is missing in /etc/claude-cloud.env; rerun the connector installer.")
+    name = re.sub(r"\s+", " ", str(b.get("shop_name") or "").strip())
+    if not re.fullmatch(NAME_RE, name):
+        raise Refused("Shop name: 2-40 letters, numbers, spaces, & . or -.")
+    slug = str(b.get("slug") or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"))[:24].strip("-")
+    if not re.fullmatch(SLUG_RE, slug):
+        raise Refused("Short name: 3-24 lowercase letters, numbers or -.")
+    domain = str(b.get("custom_domain") or "").strip().lower()
+    if domain and not re.fullmatch(DOMAIN_RE, domain):
+        raise Refused("That web address doesn't look right.")
+    voice = b.get("phone_ordering") is True
     kit = kit_info()
     if not kit:
-        raise Refused(f"No kit uploaded yet. Upload sweetspot-system.zip to {KIT} first.")
-    if kit["bytes"] > 20 * 1024 * 1024:
-        raise Refused("The kit is over 20 MB; that isn't the Sweet Spot kit.")
-    domain = str(b.get("custom_domain") or "").strip().lower()
-    if domain and not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", domain):
-        raise Refused("That custom domain doesn't look right.")
-    existing = droplets()
-    if existing:
-        x = existing[0]
-        raise Refused(f"A Sweet Spot server already exists: {x['name']} {x['ip'] or ''} ({x['status']}). Only one is allowed.")
+        raise Refused("No kit uploaded yet: upload sweetspot-system.zip on the private page first.")
+    if kit["bytes"] > 25 * 1024 * 1024:
+        raise Refused("The kit is over 25 MB; that isn't the shop kit.")
+    menu_sha = ""
+    if os.path.exists(menu_path(slug)):
+        with open(menu_path(slug), "rb") as f:
+            menu_sha = hashlib.sha256(f.read()).hexdigest()
     s = load_state()
-    if s.get("status") in ("creating", "installing") and time.time() - s.get("started_ts", 0) < 1800:
-        raise Refused("A Sweet Spot server is already being created.")
+    mine = droplets(f"shop-{slug}")
+    if mine:
+        x = mine[0]
+        raise Refused(f"{name} already has a server: {x['name']} {x['ip'] or ''} ({x['status']}). Only one per shop.")
+    sh = s["shops"].get(slug, {})
+    if sh.get("status") in ("creating", "installing") and time.time() - sh.get("started_ts", 0) < 1800:
+        raise Refused(f"{name}'s server is already being created.")
+    limit = int(e.get("MAX_SHOPS") or 10)
+    if len(droplets()) >= limit:
+        raise Refused(f"There are already {limit} shop servers (the limit). An admin can raise MAX_SHOPS in /etc/claude-cloud.env.")
     keys = [k["id"] for k in cmd_ssh_keys(None)]
     kit_code, cb_code = secrets.token_hex(24), secrets.token_hex(24)
-    script = (USER_DATA.replace("__KIT_URL__", f"https://{host}/cloud/kit/{kit_code}")
-              .replace("__KIT_SHA256__", kit["sha256"]).replace("__CALLBACK_URL__", f"https://{host}/cloud/callback")
-              .replace("__CALLBACK_TOKEN__", cb_code).replace("__CUSTOM_DOMAIN__", domain))
-    new = {"status": "creating", "started_ts": time.time(), "started_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
-           "kit_code_hash": sha(kit_code), "callback_code_hash": sha(cb_code), "codes_expire": time.time() + CODE_HOURS * 3600,
-           "kit_downloads": 0, "kit_sha256": kit["sha256"], "domain": domain or None}
-    save_state(new)
+    script = USER_DATA
+    for k, v in {"__KIT_URL__": f"https://{host}/cloud/kit/{kit_code}", "__KIT_SHA256__": kit["sha256"], "__MENU_SHA256__": menu_sha,
+                 "__CALLBACK_URL__": f"https://{host}/cloud/callback", "__CALLBACK_TOKEN__": cb_code, "__CUSTOM_DOMAIN__": domain,
+                 "__SHOP_NAME__": name, "__VOICE__": "1" if voice else "0"}.items():
+        script = script.replace(k, v)
+    s["shops"][slug] = {"shop_name": name, "status": "creating", "started_ts": time.time(), "started_at": now_utc(), "phone_ordering": voice,
+                        "kit_code_hash": sha(kit_code), "callback_code_hash": sha(cb_code), "codes_expire": time.time() + CODE_HOURS * 3600,
+                        "kit_downloads": 0, "domain": domain or None}
+    save_state(s)
     try:
-        r = do("POST", "/droplets", {**DROPLET, "ssh_keys": keys, "user_data": script})
+        r = do("POST", "/droplets", {**SIZE, "name": f"shop-{slug}", "tags": [ALL_TAG, f"shop-{slug}"], "ssh_keys": keys, "user_data": script})
     except Refused as ex:
-        new.update(status="failed", error=str(ex))
-        save_state(new)
+        s = load_state()
+        s["shops"][slug].update(status="failed", error=str(ex))
+        save_state(s)
         raise
-    new.update(status="installing", droplet_id=r.get("droplet", {}).get("id"))
-    save_state(new)
-    return {"created": True, "droplet_id": new["droplet_id"], "name": DROPLET["name"], "region": "London (lon1)", "size": "2 GB",
-            "ssh_keys_added": len(keys), "next": "It installs itself (about 8-10 minutes) and reports back; check with cloud_status."}
+    s = load_state()
+    s["shops"][slug].update(status="installing", droplet_id=r.get("droplet", {}).get("id"))
+    save_state(s)
+    sweet = name == "Sweet Spot"
+    return {"created": True, "shop": name, "slug": slug, "droplet_id": s["shops"][slug]["droplet_id"], "name": f"shop-{slug}",
+            "region": "London (lon1)", "size": "2 GB", "ssh_keys_added": len(keys),
+            "menu": "uploaded menu" if menu_sha else ("Sweet Spot's menu" if sweet else "empty (fill it in the back panel)"),
+            "phone_ordering": voice, "next": "It installs itself (about 8-10 minutes) and reports back; check with cloud_status."}
 
 
-def _code_ok(s: dict, field: str, code: str) -> bool:
-    return bool(code) and re.fullmatch(r"[0-9a-f]{48}", code) is not None and s.get(field) and \
-        secrets.compare_digest(s[field], sha(code)) and time.time() < s.get("codes_expire", 0)
+# ------------------------------------------------------------------ the new server's downloads and report
+def _find(field: str, code: str):
+    if not (isinstance(code, str) and re.fullmatch(r"[0-9a-f]{48}", code)):
+        return None, None
+    s = load_state()
+    for slug, sh in s["shops"].items():
+        if sh.get(field) and secrets.compare_digest(sh[field], sha(code)) and time.time() < sh.get("codes_expire", 0):
+            return s, slug
+    return None, None
 
 
 def cmd_kit(args):
-    s = load_state()
-    if not _code_ok(s, "kit_code_hash", args[0] if args else "") or s.get("kit_downloads", 0) >= KIT_DOWNLOADS:
+    s, slug = _find("kit_code_hash", args[0] if args else "")
+    if not slug or s["shops"][slug].get("kit_downloads", 0) >= KIT_DOWNLOADS:
         raise Refused("not found")
-    s["kit_downloads"] = s.get("kit_downloads", 0) + 1
+    s["shops"][slug]["kit_downloads"] = s["shops"][slug].get("kit_downloads", 0) + 1
     save_state(s)
-    with open(KIT, "rb") as f:
+    path = menu_path(slug) if len(args) > 1 and args[1] == "menu" else KIT
+    if not os.path.exists(path):
+        raise Refused("not found")
+    with open(path, "rb") as f:
         sys.stdout.write(base64.b64encode(f.read()).decode())
     return None
 
 
 def cmd_callback(_):
     b = json.loads(sys.stdin.read() or "{}")
-    s = load_state()
-    if s.get("status") != "installing" or not _code_ok(s, "callback_code_hash", str(b.get("token", ""))):
+    s, slug = _find("callback_code_hash", str(b.get("token", "")))
+    if not slug or s["shops"][slug].get("status") != "installing":
         raise Refused("not found")
+    sh = s["shops"][slug]
     clean = lambda v, n: re.sub(r"[^\x20-\x7e]", "", str(v or ""))[:n]  # noqa: E731
     ip, domain = clean(b.get("ip"), 45), clean(b.get("domain"), 120).lower()
     if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain or "x"):
@@ -265,39 +339,51 @@ def cmd_callback(_):
         setup = ""
     conn = clean(b.get("connector_url"), 300)
     if conn and re.fullmatch(rf"https://{re.escape(domain)}/mcp/[0-9a-f]{{64}}", conn):
-        fd = os.open(CONNECTOR_URL, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(conn + "\n")
+        _write_private(connector_path(slug), (conn + "\n").encode())
     ok = b.get("ok") is True
-    s.update(status="ready" if ok else "failed", ip=ip or None, domain=domain or s.get("domain"), setup_url=setup or None,
-             finished_at=time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), log_tail=None if ok else clean(b.get("log_tail"), 1500),
-             error=None if ok else "The new server's install failed; see log_tail.")
-    s.pop("callback_code_hash", None)  # single use
-    s.pop("kit_code_hash", None)
+    sh.update(status="ready" if ok else "failed", ip=ip or None, domain=domain or sh.get("domain"), setup_url=setup or None,
+              finished_at=now_utc(), log_tail=None if ok else clean(b.get("log_tail"), 1500),
+              error=None if ok else "The new server's install failed; see log_tail.")
+    sh.pop("callback_code_hash", None)  # single use
+    sh.pop("kit_code_hash", None)
     save_state(s)
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ admin-only (never through the connector)
+def _not_connector(what: str):
+    if os.environ.get("SUDO_USER") == "claude-mcp":
+        raise Refused(f"Only you can do this, on the server: sudo claude-cloud-helper {what}")
+
+
 def cmd_set_token(_):
-    if os.geteuid() != 0 or os.environ.get("SUDO_USER") == "claude-mcp":
-        raise Refused("Run this yourself on the server: sudo claude-cloud-helper set-token")
+    _not_connector("set-token")
     t = getpass.getpass("DigitalOcean token (input hidden): ").strip()
     if not re.fullmatch(r"dop_v1_[0-9A-Za-z]{40,128}", t):
         raise Refused("That doesn't look like a DigitalOcean token (it starts with dop_v1_).")
     e = env()
     e["DO_TOKEN"] = t
     write_env(e)
-    print("Saved. Claude can now create the Sweet Spot server.")
+    print("Saved. Shop servers can now be created.")
     return None
 
 
-def cmd_connector_url(_):
-    if os.environ.get("SUDO_USER") == "claude-mcp":
-        raise Refused("Only you can read this, on the server: sudo claude-cloud-helper connector-url")
+def cmd_connector_url(args):
+    _not_connector("connector-url <shop>")
+    slug = args[0] if args else ""
     try:
-        print(open(CONNECTOR_URL).read().strip())
+        print(open(connector_path(slug)).read().strip())
     except OSError:
-        raise Refused("No new server connector yet.")
+        raise Refused(f"No connector yet for {slug or '(give the shop short name)'}.")
+    return None
+
+
+def cmd_ui_link(_):
+    _not_connector("ui-link")
+    e = env()
+    if not e.get("UI_KEY") or not e.get("PUBLIC_HOST"):
+        raise Refused("No page key yet: rerun the connector installer.")
+    print(f"https://{e['PUBLIC_HOST']}/cloud/ui#k={e['UI_KEY']}")
     return None
 
 
@@ -326,11 +412,12 @@ def cmd_ui(args):
     what = args[0] if args else ""
     if what == "status":
         out = cmd_status(None)
-        try:
-            out["new_server_connector_url"] = open(CONNECTOR_URL).read().strip()  # the page owner may see it; Claude never calls this
-        except OSError:
-            out["new_server_connector_url"] = None
-        out["install"].pop("new_server_connector", None)
+        for slug, sh in out["shops"].items():  # the page owner may see these addresses; Claude's tools never do
+            try:
+                sh["connector_url"] = open(connector_path(slug)).read().strip()
+            except OSError:
+                sh["connector_url"] = None
+            sh.pop("connector", None)
         return out
     if what == "token":
         t = str(b.get("token", "")).strip()
@@ -343,9 +430,22 @@ def cmd_ui(args):
             n = len(cmd_ssh_keys(None))
         except Refused as ex:
             return {"saved": True, "works": False, "message": str(ex)}
-        return {"saved": True, "works": True, "message": f"Token works. {n} SSH key(s) on the account will go on the new server."}
+        return {"saved": True, "works": True, "message": f"Token works. {n} SSH key(s) on the account will go on new servers."}
+    if what == "menu":
+        slug = str(b.get("slug") or "")
+        if not re.fullmatch(SLUG_RE, slug):
+            raise Refused("Short name: 3-24 lowercase letters, numbers or -.")
+        menu = b.get("menu")
+        if not isinstance(menu, dict) or menu.get("schema") not in ("shop-menu/1", "sweetspot-menu/1") or not isinstance(menu.get("categories"), list):
+            raise Refused("That isn't a menu file (it needs \"schema\": \"shop-menu/1\" and categories; see shop-menu-template.json).")
+        items = sum(len(c.get("items") or []) for c in menu["categories"] if isinstance(c, dict))
+        if not items:
+            raise Refused("That menu has no items.")
+        _write_private(menu_path(slug), json.dumps(menu).encode())
+        return {"saved": True, "slug": slug, "sections": len(menu["categories"]), "items": items}
     if what == "create":
-        sys.stdin = io.StringIO(json.dumps({"confirm": b.get("confirm") is True, "custom_domain": b.get("custom_domain") or ""}))
+        sys.stdin = io.StringIO(json.dumps({"confirm": b.get("confirm") is True, "shop_name": b.get("shop_name"), "slug": b.get("slug"),
+                                            "custom_domain": b.get("custom_domain") or "", "phone_ordering": b.get("phone_ordering") is True}))
         return cmd_create(None)
     raise Refused("unknown page action")
 
@@ -367,28 +467,13 @@ def cmd_ui_kit(_):
     except zipfile.BadZipFile:
         raise Refused("That zip file is damaged.")
     if "sweetspot-project/install.sh" not in names or any(n.startswith("/") or ".." in n.split("/") for n in names):
-        raise Refused("That isn't the Sweet Spot kit (sweetspot-project/install.sh is missing).")
-    tmp = KIT + ".upload"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    os.replace(tmp, KIT)
+        raise Refused("That isn't the shop kit (sweetspot-project/install.sh is missing).")
+    _write_private(KIT, data)
     return {"saved": True, **kit_info()}
 
 
-def cmd_ui_link(_):
-    if os.environ.get("SUDO_USER") == "claude-mcp":
-        raise Refused("Only you can read this, on the server: sudo claude-cloud-helper ui-link")
-    e = env()
-    if not e.get("UI_KEY") or not e.get("PUBLIC_HOST"):
-        raise Refused("No page key yet: rerun the connector installer.")
-    print(f"https://{e['PUBLIC_HOST']}/cloud/ui#k={e['UI_KEY']}")
-    return None
-
-
 COMMANDS = {"status": cmd_status, "ssh-keys": cmd_ssh_keys, "create": cmd_create, "kit": cmd_kit, "callback": cmd_callback,
-            "set-token": cmd_set_token, "connector-url": cmd_connector_url,
-            "ui": cmd_ui, "ui-kit": cmd_ui_kit, "ui-link": cmd_ui_link}
+            "set-token": cmd_set_token, "connector-url": cmd_connector_url, "ui": cmd_ui, "ui-kit": cmd_ui_kit, "ui-link": cmd_ui_link}
 
 
 def main(argv):

@@ -16,7 +16,7 @@ const ast = new Asterisk(runner, cfg);
 const PORT = Number(process.env.PORT || 8787);
 // App side (voice agents in /opt/...): on when APP_HELPER_CMD is set (the installer sets it).
 const appSrv = process.env.APP_HELPER_CMD ? new AppServer(runner, process.env.APP_HELPER_CMD, cfg.allowWrite) : null;
-// Creating the Sweet Spot server on DigitalOcean: on when CLOUD_HELPER_CMD is set (the installer sets it on the BCU server).
+// Creating shop servers on DigitalOcean: on when CLOUD_HELPER_CMD is set (the installer sets it on the phone server).
 const cloud = process.env.CLOUD_HELPER_CMD ? new CloudServer(runner, process.env.CLOUD_HELPER_CMD, cfg.allowWrite) : null;
 
 const audit = (tool: string, args: unknown, ok: boolean, note = "") =>
@@ -142,23 +142,26 @@ function registerAsteriskTools(s: McpServer) {
 
 }
 
-/** Cloud side: create the one Sweet Spot server on DigitalOcean (via claude-cloud-helper, which holds the token). */
+/** Cloud side: create shop servers on DigitalOcean, one per shop (via claude-cloud-helper, which holds the token). */
 function registerCloudTools(s: McpServer, c: CloudServer) {
-  s.registerTool("cloud_status", { title: "Sweet Spot server status", annotations: { readOnlyHint: true },
-    description: "Whether the DigitalOcean token and the Sweet Spot kit are in place, the Sweet Spot server (if any), and its install progress: " +
+  s.registerTool("cloud_status", { title: "Shop servers status", annotations: { readOnlyHint: true },
+    description: "Whether the DigitalOcean token and the shop kit are in place, every shop server, and each one's install progress: " +
       "status, address, the one-time setup link once ready, or the install log if it failed.", inputSchema: {} },
   wrap("cloud_status", async () => text(await c.status())));
 
   s.registerTool("cloud_ssh_keys", { title: "DigitalOcean SSH keys", annotations: { readOnlyHint: true },
-    description: "Names of the SSH keys on the DigitalOcean account; all of them are put on the new server.", inputSchema: {} },
+    description: "Names of the SSH keys on the DigitalOcean account; all of them are put on new servers.", inputSchema: {} },
   wrap("cloud_ssh_keys", async () => text(await c.sshKeys())));
 
-  s.registerTool("create_sweetspot_server", { title: "Create the Sweet Spot server", annotations: { destructiveHint: false, openWorldHint: true },
-    description: "Creates THE Sweet Spot server on DigitalOcean (London, 2 GB, Ubuntu 24.04, about $12/month) which installs the Sweet Spot " +
-      "ordering system and its own connector by itself, then reports back (about 8-10 minutes; check cloud_status). Refuses if one already " +
-      "exists. Costs money: only call when the user has explicitly asked to create it, with confirm: true.",
-    inputSchema: { confirm: z.literal(true), custom_domain: z.string().max(120).optional() } },
-  wrap("create_sweetspot_server", async ({ custom_domain }: { confirm: true; custom_domain?: string }) => text(await c.create(custom_domain))));
+  s.registerTool("create_shop_server", { title: "Create a shop server", annotations: { destructiveHint: false, openWorldHint: true },
+    description: "Creates a shop's own server on DigitalOcean (London, 2 GB, Ubuntu 24.04, about $12/month each), which installs the shop " +
+      "ordering system (WhatsApp + back panel, plus phone ordering if asked) and its own connector by itself, then reports back " +
+      "(about 8-10 minutes; check cloud_status). One server per shop; refuses duplicates and anything over the shop limit. The menu is " +
+      "the one uploaded for that shop on the private page; without one, Sweet Spot gets its own menu and other shops start empty. " +
+      "phone_ordering is tuned to Sweet Spot's menu. Costs money: only call when the user has explicitly asked, with confirm: true.",
+    inputSchema: { confirm: z.literal(true), shop_name: z.string().min(2).max(40), slug: z.string().max(24).optional(),
+      custom_domain: z.string().max(120).optional(), phone_ordering: z.boolean().optional() } },
+  wrap("create_shop_server", async ({ confirm: _c, ...a }: { confirm: true; shop_name: string; slug?: string; custom_domain?: string; phone_ordering?: boolean }) => text(await c.create(a))));
 }
 
 /** App side: the voice agents' files in /opt/... and their systemd services (via claude-app-helper). */

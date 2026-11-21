@@ -15,7 +15,7 @@ writeFileSync(`${D}/cloud.env`, `DO_TOKEN=dop_v1_secret\nPUBLIC_HOST=bcu.example
 mkdirSync(`${D}/k/sweetspot-project`, { recursive: true }); writeFileSync(`${D}/k/sweetspot-project/install.sh`, "echo hi\n");
 execSync(`cd ${D}/k && zip -qr ${D}/real-kit.zip sweetspot-project`);
 const kit = randomBytes(2_500_000);  // bigger than the normal 2 MB command output limit
-writeFileSync(`${D}/state/sweetspot-system.zip`, kit);
+writeFileSync(`${D}/state/kit.zip`, kit);
 const TOKEN = "k".repeat(40), PORT = 18789;
 const env = { ...process.env, CONNECTOR_TOKEN: TOKEN, PORT: String(PORT), RUN_MODE: "local", ASTERISK_TOOLS: "false",
   CLOUD_HELPER_CMD: `env CLOUD_TEST_DIR=${D} python3 ${process.cwd()}/test/cloud-helper-stub.py` };
@@ -30,18 +30,18 @@ try {
   await c.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp/${TOKEN}`)));
   await t("cloud tools listed (and nothing to delete servers)", async () => {
     const names = (await c.listTools()).tools.map((x) => x.name);
-    assert.deepEqual(names.sort(), ["cloud_ssh_keys", "cloud_status", "create_sweetspot_server"]);
+    assert.deepEqual(names.sort(), ["cloud_ssh_keys", "cloud_status", "create_shop_server"]);
   });
   await t("status shows token set and kit uploaded, token itself never", async () => {
     const r = await call(c, "cloud_status"); assert.match(r.t, /"token_set": true/); assert.match(r.t, /"bytes": 2500000/); assert.doesNotMatch(r.t, /dop_v1/);
   });
-  await t("create needs confirm: true", async () => { const r = await call(c, "create_sweetspot_server", {}); assert.equal(r.err, true); });
+  await t("create needs confirm: true", async () => { const r = await call(c, "create_shop_server", { shop_name: "Sweet Spot" }); assert.equal(r.err, true); });
   let ud = "";
   await t("create makes the server", async () => {
-    const r = await call(c, "create_sweetspot_server", { confirm: true }); assert.equal(r.err, false, r.t); assert.match(r.t, /"droplet_id": 77/);
-    ud = readFileSync(`${D}/user_data`, "utf8");
+    const r = await call(c, "create_shop_server", { confirm: true, shop_name: "Sweet Spot", slug: "sweetspot", phone_ordering: true }); assert.equal(r.err, false, r.t); assert.match(r.t, /"droplet_id": 77/);
+    ud = readFileSync(`${D}/user_data_shop-sweetspot`, "utf8");
   });
-  await t("second create refused", async () => { const r = await call(c, "create_sweetspot_server", { confirm: true }); assert.equal(r.err, true); assert.match(r.t, /already exists/); });
+  await t("second Sweet Spot server refused", async () => { const r = await call(c, "create_shop_server", { confirm: true, shop_name: "Sweet Spot", slug: "sweetspot" }); assert.equal(r.err, true); assert.match(r.t, /already has a server/); });
   const kitCode = ud.match(/\/cloud\/kit\/([0-9a-f]{48})/)[1], cb = ud.match(/CALLBACK_TOKEN='([0-9a-f]{48})'/)[1];
   await t("kit route refuses a wrong code", async () => { const r = await fetch(`${base}/cloud/kit/${"0".repeat(48)}`); assert.equal(r.status, 404); });
   await t("kit route streams the whole kit (2.5 MB) with the right code", async () => {
@@ -64,7 +64,7 @@ try {
   const page = (what, body) => fetch(`${base}/cloud/api/${what}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   await t("page loads with strict security headers", async () => {
     const r = await fetch(`${base}/cloud/ui`); assert.equal(r.status, 200);
-    assert.match(r.headers.get("content-security-policy"), /default-src 'none'/); assert.match(await r.text(), /Create Sweet Spot server/);
+    assert.match(r.headers.get("content-security-policy"), /default-src 'none'/); assert.match(await r.text(), /Add a shop/);
   });
   await t("page actions refuse a wrong key", async () => { const r = await page("status", { key: "x".repeat(48) }); assert.equal(r.status, 403); });
   await t("page shows status with the right key (never the DigitalOcean token)", async () => {
@@ -90,12 +90,21 @@ try {
     const r = await fetch(`${base}/cloud/api/kit`, { method: "POST", headers: { "x-ui-key": "z".repeat(48) }, body: readFileSync(`${D}/real-kit.zip`) });
     assert.equal(r.status, 403);
   });
-  await t("page create refuses while the server exists", async () => {
-    const r = await page("create", { key: UIK, confirm: true }); assert.equal(r.status, 400); assert.match((await r.json()).error, /already exists/);
+  await t("page create refuses a second server for the same shop", async () => {
+    const r = await page("create", { key: UIK, confirm: true, shop_name: "Sweet Spot", slug: "sweetspot" }); assert.equal(r.status, 400); assert.match((await r.json()).error, /already has a server/);
+  });
+  await t("page adds a second shop with its own menu", async () => {
+    const menu = { schema: "shop-menu/1", categories: [{ id: "burgers", items: [{ id: "b", name: "Burger", price_pence: 799 }] }] };
+    const m = await page("menu", { key: UIK, slug: "burger-barn", menu }); assert.equal(m.status, 200);
+    const r = await page("create", { key: UIK, confirm: true, shop_name: "Burger Barn", slug: "burger-barn" }); const d = await r.json();
+    assert.equal(r.status, 200, JSON.stringify(d)); assert.equal(d.menu, "uploaded menu");
+    const ud2 = readFileSync(`${D}/user_data_shop-burger-barn`, "utf8"); const code = ud2.match(/\/cloud\/kit\/([0-9a-f]{48})/)[1];
+    const got = await fetch(`${base}/cloud/kit/${code}/menu`); assert.equal(got.status, 200);
+    assert.deepEqual(JSON.parse(Buffer.from(await got.text(), "base64").toString()), menu);
   });
   await t("the new server's connector address shows on the page only", async () => {
-    const st = JSON.parse(readFileSync(`${D}/state/state.json`, "utf8")); st.status = "installing";
-    st.callback_code_hash = createHash("sha256").update("a".repeat(48)).digest("hex"); st.codes_expire = Date.now() / 1000 + 3600;
+    const st = JSON.parse(readFileSync(`${D}/state/state.json`, "utf8")); const sh = st.shops["burger-barn"]; sh.status = "installing";
+    sh.callback_code_hash = createHash("sha256").update("a".repeat(48)).digest("hex"); sh.codes_expire = Date.now() / 1000 + 3600;
     writeFileSync(`${D}/state/state.json`, JSON.stringify(st));
     const dom = "9-9-9-9.sslip.io", cu = `https://${dom}/mcp/${"9".repeat(64)}`;
     const cb = await fetch(`${base}/cloud/callback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: "a".repeat(48), ok: true, domain: dom, connector_url: cu }) });
