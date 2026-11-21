@@ -207,7 +207,8 @@ CONNECTOR_TAR='https://github.com/bcuproject/asterisk-connector/archive/refs/hea
 
 report() {  # $1 = true/false
   local tail body cu=""
-  tail=$(tail -n 30 /var/log/shop-provision.log | tr -d '\000-\010\013-\037"\\' | tail -c 1500)
+  # One line, no quotes/backslashes/control characters: it goes inside a JSON string (line breaks broke it: 400).
+  tail=$(tail -n 30 /var/log/shop-provision.log | grep -v -e '/mcp/' -e '#t=' | tr '\n\t' '  ' | tr -d '\000-\037"\\' | tail -c 1500)
   [ -f /etc/asterisk-connector.env ] && cu="https://$DOMAIN/mcp/$(sed -n 's/^CONNECTOR_TOKEN=//p' /etc/asterisk-connector.env)"
   body="{\"token\":\"$CALLBACK_TOKEN\",\"ok\":$1,\"ip\":\"${IP:-}\",\"domain\":\"${DOMAIN:-}\",\"setup_url\":\"${SETUP_URL:-}\",\"connector_url\":\"$cu\",\"log_tail\":\"$tail\"}"
   curl -fsS -m 20 -X POST "$CALLBACK_URL" -H "Content-Type: application/json" --data-binary @- <<<"$body" >/dev/null || true
@@ -294,7 +295,7 @@ def cmd_create(_):
     s = load_state()
     s["shops"][slug].update(status="installing", droplet_id=r.get("droplet", {}).get("id"))
     save_state(s)
-    sweet = name == "Sweet Spot"
+    sweet = name.lower() == "sweet spot"
     return {"created": True, "shop": name, "slug": slug, "droplet_id": s["shops"][slug]["droplet_id"], "name": f"shop-{slug}",
             "region": "London (lon1)", "size": "2 GB", "ssh_keys_added": len(keys),
             "menu": "uploaded menu" if menu_sha else ("Sweet Spot's menu" if sweet else "empty (fill it in the back panel)"),
