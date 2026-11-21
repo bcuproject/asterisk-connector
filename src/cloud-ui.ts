@@ -150,6 +150,7 @@ $("tokSave").onclick = async () => {
   try { const r = await call("token", { token: t }); $("tok").value = ""; $("tokMsg").innerHTML = '<span class="' + (r.works ? "ok" : "bad") + '">' + esc(r.message) + "</span>"; refresh(); }
   catch (e) { $("tokMsg").innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
 };
+$("kit").onchange = () => $("kitSave").onclick();  // choosing the file is enough: upload straight away
 $("kitSave").onclick = async () => {
   const f = $("kit").files[0]; if (!f) return;
   $("kitMsg").textContent = "Uploading…";
