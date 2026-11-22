@@ -229,6 +229,8 @@ if [ -n "$MENU_SHA256" ]; then
   MENU_FILE=/root/menu.json
 fi
 SHOP_NAME="$SHOP_NAME" MENU_FILE="$MENU_FILE" VOICE="$VOICE" bash /root/sweetspot-project/install.sh "$DOMAIN" || fail "shop install"
+# Installed copies live in /opt/sweetspot; the downloaded kit (reference files, tests) isn't needed on the shop.
+rm -rf /root/sweetspot-project /root/shop-kit.zip /root/menu.json
 SETUP_URL="https://$DOMAIN/setup#t=$(sed -n 's/^SETUP_TOKEN=//p' /etc/sweetspot-bot.env)"
 # The same connector as the phone server (app tools only), so Claude can manage this server too. Reached at /mcp.
 (cd /root && curl -fsSL "$CONNECTOR_TAR" | tar xz && sh asterisk-connector-main/setup/install-on-asterisk-server.sh "$DOMAIN") || echo "connector install failed (the shop itself is fine)"
