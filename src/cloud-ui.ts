@@ -35,6 +35,7 @@ export const CLOUD_UI = `<!doctype html>
   .shop { border-left: 5px solid var(--line); } .shop.ready { border-left-color: var(--ok); } .shop.installing { border-left-color: var(--warn); } .shop.failed { border-left-color: var(--brand); }
   .row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
   .chk { display: flex; gap: 8px; align-items: center; color: var(--ink); }
+  .link { background: none; border: 0; padding: 0; color: var(--muted); text-decoration: underline; cursor: pointer; font: inherit; font-size: 14px; }
   details summary { cursor: pointer; font-weight: 700; }
   #locked { display: none; }
 </style>
@@ -65,10 +66,12 @@ export const CLOUD_UI = `<!doctype html>
     <label>Own web address (optional; leave empty to use the server's built-in one) <input id="dom" type="text" placeholder="orders.burgerbarn.co.uk" autocomplete="off"></label>
     <label>Menu file (optional, .json in the shop-menu format; without it Sweet Spot gets its own menu and other shops start empty)
       <input id="menu" type="file" accept=".json,application/json"></label>
+    <button type="button" class="link" id="menuClear">Clear menu file</button>
     <label class="chk"><input id="voice" type="checkbox"> Phone ordering (tuned to Sweet Spot's menu)</label>
+    <label class="chk"><input id="backups" type="checkbox" checked> Weekly DigitalOcean backups of the whole server (about $2.40 a month extra)</label>
     <button class="big" id="create" disabled>Create server for this shop</button>
     <div class="msg" id="createMsg"></div>
-    <p>Each server is about <b>$12 a month</b> on your DigitalOcean bill. This page can create servers but can't delete or change them.</p>
+    <p>Each server is about <b>$12 a month</b> on your DigitalOcean bill (plus backups if ticked). Every shop also copies its database every night (last 14 days kept on the server). This page can create servers but can't delete or change them.</p>
   </section>
 
   <section id="upd"><h2>Update this page</h2>
@@ -160,9 +163,10 @@ $("kitSave").onclick = async () => {
   $("kitMsg").innerHTML = r.ok ? '<span class="ok">✔ Uploaded</span>' : '<span class="bad">' + esc(d.error || "Upload failed") + "</span>";
   refresh();
 };
+$("menuClear").onclick = () => { $("menu").value = ""; $("createMsg").textContent = ""; };
 $("create").onclick = async () => {
   const name = $("name").value.trim(), slug = ($("slug").value.trim() || slugOf(name)).toLowerCase();
-  if (!confirm("Create a server for " + name + "? It costs about $12 a month on your DigitalOcean account.")) return;
+  if (!confirm("Create a server for " + name + "? It costs about $12 a month on your DigitalOcean account" + ($("backups").checked ? " (plus about $2.40 for backups)." : "."))) return;
   $("create").disabled = true; $("createMsg").textContent = "Working…";
   try {
     const f = $("menu").files[0];
@@ -170,9 +174,9 @@ $("create").onclick = async () => {
       let menu; try { menu = JSON.parse(await f.text()); } catch { throw new Error("That menu file isn't valid JSON."); }
       const m = await call("menu", { slug, menu }); $("createMsg").textContent = "Menu saved (" + m.items + " items). Creating…";
     }
-    const r = await call("create", { confirm: true, shop_name: name, slug, custom_domain: $("dom").value.trim().toLowerCase(), phone_ordering: $("voice").checked });
+    const r = await call("create", { confirm: true, shop_name: name, slug, custom_domain: $("dom").value.trim().toLowerCase(), phone_ordering: $("voice").checked, backups: $("backups").checked });
     $("createMsg").innerHTML = '<span class="ok">✔ ' + esc(r.shop) + " server created — installing now (menu: " + esc(r.menu) + ").</span>";
-    ["name", "slug", "dom"].forEach((i) => { $(i).value = ""; }); $("menu").value = ""; $("voice").checked = false; slugEdited = false;
+    ["name", "slug", "dom"].forEach((i) => { $(i).value = ""; }); $("menu").value = ""; $("voice").checked = false; $("backups").checked = true; slugEdited = false;
   } catch (e) { $("createMsg").innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
   refresh();
 };

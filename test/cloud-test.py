@@ -115,6 +115,8 @@ body = [c for c in calls if c[0] == "POST"][0][3]
 check(body["name"] == "shop-sweetspot" and body["tags"] == ["bcu-shop", "shop-sweetspot"] and body["region"] == "lon1"
       and body["size"] == "s-1vcpu-2gb" and body["image"] == "ubuntu-24-04-x64" and body["ssh_keys"] == [11], "London, 2 GB, Ubuntu 24.04, tagged, SSH key added")
 ud = body["user_data"]
+check(body["backups"] is True and "backups on" in r["backups"], "weekly DigitalOcean backups on by default")
+check("rm -rf /root/sweetspot-project /root/shop-kit.zip" in ud, "the downloaded kit is deleted once the shop is installed")
 check("SHOP_NAME='Sweet Spot'" in ud and "VOICE='1'" in ud and "MENU_SHA256=''" in ud, "setup script installs Sweet Spot with phone ordering")
 check(TOKEN not in ud and TOKEN not in out and TOKEN not in err, "the DigitalOcean token is never in the script or the output")
 check(subprocess.run(["bash", "-n"], input=ud, text=True).returncode == 0, "setup script is valid bash")
@@ -130,10 +132,11 @@ code, out, _ = run(["ui", "menu"], json.dumps({"key": "u" * 48, "slug": "burger-
 check(code == 0 and json.loads(out)["items"] == 1, "menu uploaded for Burger Barn")
 code, _, err = run(["ui", "menu"], json.dumps({"key": "u" * 48, "slug": "burger-barn", "menu": {"hello": 1}}))
 check(code == 1 and "menu" in err, "something that isn't a menu is refused")
-code, out, err = run(["create"], json.dumps({"confirm": True, "shop_name": "Burger Barn"}))
+code, out, err = run(["create"], json.dumps({"confirm": True, "shop_name": "Burger Barn", "backups": False}))
 r = json.loads(out or "{}")
 check(code == 0 and r["slug"] == "burger-barn" and r["menu"] == "uploaded menu" and not r["phone_ordering"], f"Burger Barn server created (short name made from the name) {err}")
 ud2 = [c for c in calls if c[0] == "POST"][1][3]["user_data"]
+check([c for c in calls if c[0] == "POST"][1][3]["backups"] is False and r["backups"] == "off", "backups can be switched off per shop")
 check("SHOP_NAME='Burger Barn'" in ud2 and "VOICE='0'" in ud2 and hashlib.sha256(json.dumps(menu).encode()).hexdigest() in ud2, "its setup script carries its name and menu checksum, phone ordering off")
 bb_kit = re.search(r"/cloud/kit/([0-9a-f]{48})", ud2).group(1)
 

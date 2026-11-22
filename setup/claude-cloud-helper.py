@@ -256,6 +256,7 @@ def cmd_create(_):
     if domain and not re.fullmatch(DOMAIN_RE, domain):
         raise Refused("That web address doesn't look right.")
     voice = b.get("phone_ordering") is True
+    backups = b.get("backups") is not False   # DigitalOcean weekly backups: on unless switched off (+20% of the server price)
     kit = kit_info()
     if not kit:
         raise Refused("No kit uploaded yet: upload sweetspot-system.zip on the private page first.")
@@ -283,12 +284,12 @@ def cmd_create(_):
                  "__CALLBACK_URL__": f"https://{host}/cloud/callback", "__CALLBACK_TOKEN__": cb_code, "__CUSTOM_DOMAIN__": domain,
                  "__SHOP_NAME__": name, "__VOICE__": "1" if voice else "0"}.items():
         script = script.replace(k, v)
-    s["shops"][slug] = {"shop_name": name, "status": "creating", "started_ts": time.time(), "started_at": now_utc(), "phone_ordering": voice,
+    s["shops"][slug] = {"shop_name": name, "status": "creating", "started_ts": time.time(), "started_at": now_utc(), "phone_ordering": voice, "backups": backups,
                         "kit_code_hash": sha(kit_code), "callback_code_hash": sha(cb_code), "codes_expire": time.time() + CODE_HOURS * 3600,
                         "kit_downloads": 0, "domain": domain or None}
     save_state(s)
     try:
-        r = do("POST", "/droplets", {**SIZE, "name": f"shop-{slug}", "tags": [ALL_TAG, f"shop-{slug}"], "ssh_keys": keys, "user_data": script})
+        r = do("POST", "/droplets", {**SIZE, "name": f"shop-{slug}", "tags": [ALL_TAG, f"shop-{slug}"], "ssh_keys": keys, "user_data": script, "backups": backups})
     except Refused as ex:
         s = load_state()
         s["shops"][slug].update(status="failed", error=str(ex))
@@ -301,7 +302,8 @@ def cmd_create(_):
     return {"created": True, "shop": name, "slug": slug, "droplet_id": s["shops"][slug]["droplet_id"], "name": f"shop-{slug}",
             "region": "London (lon1)", "size": "2 GB", "ssh_keys_added": len(keys),
             "menu": "uploaded menu" if menu_sha else ("Sweet Spot's menu" if sweet else "empty (fill it in the back panel)"),
-            "phone_ordering": voice, "next": "It installs itself (about 8-10 minutes) and reports back; check with cloud_status."}
+            "phone_ordering": voice, "backups": "weekly DigitalOcean backups on (about $2.40 a month)" if backups else "off",
+            "next": "It installs itself (about 8-10 minutes) and reports back; check with cloud_status."}
 
 
 # ------------------------------------------------------------------ the new server's downloads and report
